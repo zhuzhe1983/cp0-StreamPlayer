@@ -52,7 +52,7 @@ static const struct libinput_interface interface = {
 /* ============================================================
  *  TCA8418 自定义键码映射表
  *
- *  这里要和 Cardputer Zero 镜像里的
+ *  这里要和 CardputerZero 镜像里的
  *  /usr/share/keymaps/tca8418_keypad_m5stack_keymap.map 保持一致。
  * ============================================================ */
 struct tca8418_keymap_entry {

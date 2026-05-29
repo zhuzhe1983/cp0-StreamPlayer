@@ -1,6 +1,6 @@
 # CardputerZero StreamPlayer
 
-LVGL-based stream player app for M5Stack Cardputer Zero.
+LVGL-based stream player app for M5Stack CardputerZero.
 
 ## Repository Layout
 
