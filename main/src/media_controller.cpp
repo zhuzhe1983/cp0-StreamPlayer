@@ -4251,7 +4251,24 @@ private:
         auto *self = static_cast<MediaController *>(lv_event_get_user_data(event));
         if (!self) return;
         lv_obj_t *target = static_cast<lv_obj_t *>(lv_event_get_target(event));
-        if (target == self->login_btn_) self->login_from_setup();
+        if (target == self->server_jf_btn_) {
+            if (self->config_.type != ServerType::Jellyfin) {
+                self->request_setup_focus(SetupFocusTarget::ServerJF);
+                self->config_.type = ServerType::Jellyfin;
+                save_config(self->config_);
+                self->show_setup();
+            }
+        } else if (target == self->server_eb_btn_) {
+            if (self->config_.type != ServerType::Emby) {
+                self->request_setup_focus(SetupFocusTarget::ServerEB);
+                self->config_.type = ServerType::Emby;
+                save_config(self->config_);
+                self->show_setup();
+            }
+        } else if (target == self->lang_switch_) {
+            self->request_setup_focus(SetupFocusTarget::Language);
+            self->toggle_language();
+        } else if (target == self->login_btn_) self->login_from_setup();
         else if (target == self->scan_btn_) self->start_lan_scan();
         else if (target == self->logout_btn_) self->logout();
         else if (target == self->small_screen_btn_ ||
@@ -4323,8 +4340,7 @@ private:
 
     static void focus_event_cb(lv_event_t *event)
     {
-        auto *self = static_cast<MediaController *>(lv_event_get_user_data(event));
-        if (self) self->update_setup_focus_marker();
+        (void)event;
     }
 
     static void player_timer_cb(lv_timer_t *timer)
@@ -4617,6 +4633,9 @@ private:
         small_screen_btn_ = nullptr;
         server_dropdown_ = nullptr;
         language_dropdown_ = nullptr;
+        server_jf_btn_ = nullptr;
+        server_eb_btn_ = nullptr;
+        lang_switch_ = nullptr;
         scan_btn_ = nullptr;
         reset_group();
     }
@@ -4711,34 +4730,32 @@ private:
         lv_obj_set_style_radius(obj, 5, 0);
         lv_obj_set_style_border_width(obj, 1, 0);
         lv_obj_set_style_pad_all(obj, 0, 0);
-        /* Vertically center 14px text inside 22px buttons: 22 - 14 = 8px. */
-        lv_obj_set_style_pad_top(obj, 4, 0);
-        lv_obj_set_style_pad_bottom(obj, 4, 0);
+        /* Vertically center 14px text inside the button height. */
+        const int text_v_pad = std::max(0, (h - 14) / 2);
+        lv_obj_set_style_pad_top(obj, text_v_pad, 0);
+        lv_obj_set_style_pad_bottom(obj, h - 14 - text_v_pad, 0);
         if (primary) {
-            /* Primary CTA: filled with the server accent; dark text keeps contrast. */
+            /* Primary CTA: filled accent + light text for strong contrast. */
             lv_obj_set_style_bg_color(obj, accent, 0);
             lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
-            lv_obj_set_style_border_color(obj, lv_color_hex(0x487A60), 0);
-            if (lv_color_brightness(accent) > 160) {
-                lv_obj_set_style_border_color(obj, lv_color_hex(0x3D6B52), 0);
-            }
+            lv_obj_set_style_border_color(obj, accent, 0);
             lv_obj_set_style_border_opa(obj, LV_OPA_COVER, 0);
-            lv_obj_set_style_text_color(obj, lv_color_hex(0x05100C), 0);
+            lv_obj_set_style_text_color(obj, lv_color_hex(0xEAF1F8), 0);
             lv_obj_set_style_bg_color(obj, lv_color_hex(0x0A1620), LV_STATE_FOCUSED);
             lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
-            lv_obj_set_style_text_color(obj, accent, LV_STATE_FOCUSED);
-            lv_obj_set_style_border_color(obj, accent, LV_STATE_FOCUSED);
+            lv_obj_set_style_text_color(obj, lv_color_hex(0xFFFFFF), LV_STATE_FOCUSED);
+            lv_obj_set_style_border_color(obj, lv_color_hex(0x4A8E6F), LV_STATE_FOCUSED);
             lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
             lv_obj_set_style_bg_color(obj, lv_color_hex(0x3E6A54), LV_STATE_PRESSED);
             lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_STATE_PRESSED);
-            lv_obj_set_style_text_color(obj, lv_color_hex(0x061018), LV_STATE_PRESSED);
+            lv_obj_set_style_text_color(obj, lv_color_hex(0xEAF1F8), LV_STATE_PRESSED);
         } else {
             /* Secondary/ghost button: quiet hairline chip, no competing fill. */
     lv_obj_set_style_bg_color(obj, lv_color_hex(0x0A1119), 0);
     lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(obj, lv_color_hex(0x1A2737), 0);
     lv_obj_set_style_border_opa(obj, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(obj, lv_color_hex(0x7A8BA0), 0);
+    lv_obj_set_style_text_color(obj, lv_color_hex(0x9AABB8), 0);
     /* Kill all theme outlines */
     lv_obj_remove_style(obj, NULL, LV_STATE_FOCUS_KEY);
     lv_obj_set_style_outline_width(obj, 0, LV_STATE_ANY);
@@ -4903,7 +4920,7 @@ private:
         lv_obj_set_style_bg_color(ta, lv_color_hex(0x0E1720), LV_STATE_FOCUSED);
         lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_STATE_FOCUSED);
         lv_obj_set_style_text_color(ta, lv_color_hex(0xFFFFFF), LV_STATE_FOCUSED);
-        lv_obj_set_style_border_side(ta, LV_BORDER_SIDE_BOTTOM, LV_STATE_FOCUSED);
+        lv_obj_set_style_border_side(ta, LV_BORDER_SIDE_FULL, LV_STATE_FOCUSED);
         lv_obj_set_style_bg_color(ta, accent_color(config_.type), LV_PART_CURSOR);
         lv_obj_set_style_width(ta, 2, LV_PART_CURSOR);
         lv_obj_set_style_pad_all(ta, 0, 0);
@@ -4913,51 +4930,6 @@ private:
         lv_obj_add_event_cb(ta, focus_event_cb, LV_EVENT_DEFOCUSED, this);
         add_to_group(ta);
         return ta;
-    }
-
-    void update_setup_focus_marker()
-    {
-        if (view_ != View::Setup || !setup_focus_marker_) return;
-
-        lv_obj_t *focused = focused_obj();
-        int y = -1;
-        int h = 2;
-        if (focused == server_dropdown_) {
-            y = 50;
-            h = 2;
-        } else if (focused == language_dropdown_) {
-            y = 50;
-            h = 2;
-        } else if (focused == url_ta_) {
-            y = 74;
-            h = 2;
-        } else if (focused == user_ta_) {
-            y = 96;
-            h = 2;
-        } else if (focused == pass_ta_) {
-            y = 96;
-            h = 2;
-        } else if (focused == login_btn_) {
-            y = 138;
-            h = 2;
-        } else if (focused == scan_btn_) {
-            y = 138;
-            h = 2;
-        }
-
-        if (y < 0) {
-            lv_obj_add_flag(setup_focus_marker_, LV_OBJ_FLAG_HIDDEN);
-            return;
-        }
-
-        lv_obj_clear_flag(setup_focus_marker_, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_width(setup_focus_marker_, 272);
-        lv_obj_set_y(setup_focus_marker_, y);
-        lv_obj_set_height(setup_focus_marker_, h);
-        lv_obj_set_x(setup_focus_marker_, 20);
-        lv_obj_set_style_radius(setup_focus_marker_, 1, 0);
-        lv_obj_set_style_bg_color(setup_focus_marker_, accent_color(config_.type), 0);
-        lv_obj_set_style_bg_opa(setup_focus_marker_, 220, 0);
     }
 
     void set_status(const std::string &text)
@@ -4978,7 +4950,7 @@ private:
         /* ============ Card ============ */
         lv_obj_t *card = lv_obj_create(root_);
         lv_obj_set_pos(card, 3, 2);
-        lv_obj_set_size(card, 314, 165);
+        lv_obj_set_size(card, 314, 156);
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_radius(card, 10, 0);
         lv_obj_set_style_bg_color(card, lv_color_hex(0x0A0F16), 0);
@@ -4990,10 +4962,10 @@ private:
         lv_obj_set_style_shadow_opa(card, 120, 0);
         lv_obj_set_style_pad_all(card, 0, 0);
 
-        /* ============ Header (brand + service/language in one compact area) ============ */
+        /* ============ Header with icon toggles ============ */
         lv_obj_t *header = lv_obj_create(card);
         lv_obj_set_pos(header, 0, 0);
-        lv_obj_set_size(header, 314, 48);
+        lv_obj_set_size(header, 314, 36);
         lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_radius(header, 10, 0);
         lv_obj_set_style_bg_color(header, lv_color_hex(0x0C121A), 0);
@@ -5001,70 +4973,181 @@ private:
         lv_obj_set_style_border_width(header, 0, 0);
         lv_obj_set_style_pad_all(header, 0, 0);
 
-        /* Brand row */
+        /* Brand + icon toggles row */
         lv_obj_t *brand_mark = lv_obj_create(header);
-        lv_obj_set_pos(brand_mark, 12, 5);
+        lv_obj_set_pos(brand_mark, 12, 9);
         lv_obj_set_size(brand_mark, 16, 16);
         lv_obj_clear_flag(brand_mark, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_radius(brand_mark, 4, 0);
         lv_obj_set_style_bg_color(brand_mark, accent_color(config_.type), 0);
         lv_obj_set_style_bg_opa(brand_mark, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(brand_mark, 0, 0);
-        label(header, "StreamPlayer", 34, 3, 150, 20, lv_color_hex(0xEAF1F8), ui_font_16());
-        label(header, "Jellyfin \xc2\xb7 Emby", 186, 5, 116, 16, lv_color_hex(0x5A6A7C), ui_font_14());
+        label(header, "StreamPlayer", 34, 9, 140, 18, lv_color_hex(0xEAF1F8), ui_font_16());
 
-        /* Service + language controls */
-        label(header, t(TextKey::Server), 12, 31, 52, 18, lv_color_hex(0x8B9AAE));
-        server_dropdown_ = dropdown(header, "Jellyfin\nEmby",
-                                    config_.type == ServerType::Emby ? 1 : 0,
-                                    64, 29, 64, 18);
-        label(header, t(TextKey::Language), 136, 31, 72, 18, lv_color_hex(0x8B9AAE));
-        language_dropdown_ = dropdown(header, "English\n中文\n日本語",
-                                      current_language() == UiLanguage::Chinese ? 1 :
-                                      (current_language() == UiLanguage::Japanese ? 2 : 0),
-                                    208, 29, 94, 18);
+        /* Jellyfin toggle icon button */
+        {
+            bool active = config_.type == ServerType::Jellyfin;
+            const lv_color_t accent = accent_color(config_.type);
+            server_jf_btn_ = lv_label_create(header);
+            lv_obj_set_pos(server_jf_btn_, 184, 9);
+            lv_obj_set_size(server_jf_btn_, 28, 18);
+            lv_label_set_text(server_jf_btn_, "JF");
+            lv_label_set_long_mode(server_jf_btn_, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_align(server_jf_btn_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_font(server_jf_btn_, ui_font_14(), 0);
+            lv_obj_set_style_radius(server_jf_btn_, 4, 0);
+            lv_obj_set_style_border_width(server_jf_btn_, 1, 0);
+            lv_obj_set_style_border_opa(server_jf_btn_, LV_OPA_COVER, 0);
+            lv_obj_set_style_pad_all(server_jf_btn_, 0, 0);
+            lv_obj_set_style_pad_top(server_jf_btn_, 2, 0);
+            lv_obj_remove_style(server_jf_btn_, NULL, LV_STATE_FOCUS_KEY);
+            lv_obj_set_style_outline_width(server_jf_btn_, 0, LV_STATE_ANY);
+            if (active) {
+                lv_obj_set_style_bg_color(server_jf_btn_, accent, 0);
+                lv_obj_set_style_bg_opa(server_jf_btn_, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_color(server_jf_btn_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_border_color(server_jf_btn_, accent, 0);
+            } else {
+                lv_obj_set_style_bg_color(server_jf_btn_, lv_color_hex(0x0A1119), 0);
+                lv_obj_set_style_bg_opa(server_jf_btn_, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_color(server_jf_btn_, lv_color_hex(0x7A8BA0), 0);
+                lv_obj_set_style_border_color(server_jf_btn_, lv_color_hex(0x1E2C3C), 0);
+            }
+            lv_obj_add_flag(server_jf_btn_, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+            lv_obj_add_flag(server_jf_btn_, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_border_width(server_jf_btn_, 1, LV_STATE_FOCUSED);
+            lv_obj_set_style_border_opa(server_jf_btn_, LV_OPA_COVER, LV_STATE_FOCUSED);
+            lv_obj_set_style_border_color(server_jf_btn_, lv_color_hex(0xFFFFFF), LV_STATE_FOCUSED);
+            lv_obj_add_event_cb(server_jf_btn_, click_event_cb, LV_EVENT_CLICKED, this);
+            lv_obj_add_event_cb(server_jf_btn_, focus_event_cb, LV_EVENT_FOCUSED, this);
+            lv_obj_add_event_cb(server_jf_btn_, focus_event_cb, LV_EVENT_DEFOCUSED, this);
+            add_to_group(server_jf_btn_);
+        }
 
-        rule(card, 12, 48, 290, lv_color_hex(0x16222E));
+        /* Emby toggle icon button */
+        {
+            bool active = config_.type == ServerType::Emby;
+            const lv_color_t accent = accent_color(config_.type);
+            server_eb_btn_ = lv_label_create(header);
+            lv_obj_set_pos(server_eb_btn_, 216, 9);
+            lv_obj_set_size(server_eb_btn_, 28, 18);
+            lv_label_set_text(server_eb_btn_, "EB");
+            lv_label_set_long_mode(server_eb_btn_, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_align(server_eb_btn_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_font(server_eb_btn_, ui_font_14(), 0);
+            lv_obj_set_style_radius(server_eb_btn_, 4, 0);
+            lv_obj_set_style_border_width(server_eb_btn_, 1, 0);
+            lv_obj_set_style_border_opa(server_eb_btn_, LV_OPA_COVER, 0);
+            lv_obj_set_style_pad_all(server_eb_btn_, 0, 0);
+            lv_obj_set_style_pad_top(server_eb_btn_, 2, 0);
+            lv_obj_remove_style(server_eb_btn_, NULL, LV_STATE_FOCUS_KEY);
+            lv_obj_set_style_outline_width(server_eb_btn_, 0, LV_STATE_ANY);
+            if (active) {
+                lv_obj_set_style_bg_color(server_eb_btn_, accent, 0);
+                lv_obj_set_style_bg_opa(server_eb_btn_, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_color(server_eb_btn_, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_border_color(server_eb_btn_, accent, 0);
+            } else {
+                lv_obj_set_style_bg_color(server_eb_btn_, lv_color_hex(0x0A1119), 0);
+                lv_obj_set_style_bg_opa(server_eb_btn_, LV_OPA_COVER, 0);
+                lv_obj_set_style_text_color(server_eb_btn_, lv_color_hex(0x7A8BA0), 0);
+                lv_obj_set_style_border_color(server_eb_btn_, lv_color_hex(0x1E2C3C), 0);
+            }
+            lv_obj_add_flag(server_eb_btn_, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+            lv_obj_add_flag(server_eb_btn_, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_border_width(server_eb_btn_, 1, LV_STATE_FOCUSED);
+            lv_obj_set_style_border_opa(server_eb_btn_, LV_OPA_COVER, LV_STATE_FOCUSED);
+            lv_obj_set_style_border_color(server_eb_btn_, lv_color_hex(0xFFFFFF), LV_STATE_FOCUSED);
+            lv_obj_add_event_cb(server_eb_btn_, click_event_cb, LV_EVENT_CLICKED, this);
+            lv_obj_add_event_cb(server_eb_btn_, focus_event_cb, LV_EVENT_FOCUSED, this);
+            lv_obj_add_event_cb(server_eb_btn_, focus_event_cb, LV_EVENT_DEFOCUSED, this);
+            add_to_group(server_eb_btn_);
+        }
 
-        /* ============ Focus marker ============ */
-        setup_focus_marker_ = lv_obj_create(card);
-        lv_obj_set_pos(setup_focus_marker_, 12, 50);
-        lv_obj_set_size(setup_focus_marker_, 290, 2);
-        lv_obj_clear_flag(setup_focus_marker_, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_border_width(setup_focus_marker_, 0, 0);
-        lv_obj_set_style_radius(setup_focus_marker_, 1, 0);
-        lv_obj_set_style_bg_color(setup_focus_marker_, accent_color(config_.type), 0);
-        lv_obj_set_style_bg_opa(setup_focus_marker_, 220, 0);
+        /* Language toggle button */
+        {
+            const char *lang_text = current_language() == UiLanguage::Chinese ? "中"
+                                  : (current_language() == UiLanguage::Japanese ? "日" : "EN");
+            lang_switch_ = lv_label_create(header);
+            lv_obj_set_pos(lang_switch_, 250, 9);
+            lv_obj_set_size(lang_switch_, 42, 18);
+            lv_label_set_text(lang_switch_, lang_text);
+            lv_label_set_long_mode(lang_switch_, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_align(lang_switch_, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_style_text_font(lang_switch_, ui_font_14(), 0);
+            lv_obj_set_style_radius(lang_switch_, 4, 0);
+            lv_obj_set_style_border_width(lang_switch_, 1, 0);
+            lv_obj_set_style_border_opa(lang_switch_, LV_OPA_COVER, 0);
+            lv_obj_set_style_pad_all(lang_switch_, 0, 0);
+            lv_obj_set_style_pad_top(lang_switch_, 2, 0);
+            lv_obj_remove_style(lang_switch_, NULL, LV_STATE_FOCUS_KEY);
+            lv_obj_set_style_outline_width(lang_switch_, 0, LV_STATE_ANY);
+            lv_obj_set_style_bg_color(lang_switch_, lv_color_hex(0x0A1119), 0);
+            lv_obj_set_style_bg_opa(lang_switch_, LV_OPA_COVER, 0);
+            lv_obj_set_style_text_color(lang_switch_, lv_color_hex(0xE4E9F0), 0);
+            lv_obj_set_style_border_color(lang_switch_, lv_color_hex(0x1E2C3C), 0);
+            lv_obj_add_flag(lang_switch_, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+            lv_obj_add_flag(lang_switch_, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_border_width(lang_switch_, 1, LV_STATE_FOCUSED);
+            lv_obj_set_style_border_opa(lang_switch_, LV_OPA_COVER, LV_STATE_FOCUSED);
+            lv_obj_set_style_border_color(lang_switch_, lv_color_hex(0xFFFFFF), LV_STATE_FOCUSED);
+            lv_obj_add_event_cb(lang_switch_, click_event_cb, LV_EVENT_CLICKED, this);
+            lv_obj_add_event_cb(lang_switch_, focus_event_cb, LV_EVENT_FOCUSED, this);
+            lv_obj_add_event_cb(lang_switch_, focus_event_cb, LV_EVENT_DEFOCUSED, this);
+            add_to_group(lang_switch_);
+        }
+
+        rule(card, 12, 41, 290, lv_color_hex(0x16222E));
 
         /* ============ Inline layout ============ */
-        lv_color_t lbl_col = lv_color_hex(0x8B9AAE);
+        lv_color_t lbl_col = lv_color_hex(0x9AABB8);
 
         /* URL. */
-        int r1y = 52, r1h = 20;
-        label(card, "URL", 12, r1y + 3, 32, r1h, lbl_col);
+        int r1y = 42, r1h = 24;
+        label(card, "URL", 12, r1y + 5, 32, r1h, lbl_col);
         url_ta_ = textarea(card, "http://192.168.x.x:8096", 44, r1y, 258, r1h, false);
 
         /* User + Password. */
-        int r2y = 76, r2h = 20;
-        label(card, t(TextKey::Account), 12, r2y + 3, 36, r2h, lbl_col);
+        int r2y = 70, r2h = 24;
+        label(card, t(TextKey::Account), 12, r2y + 5, 36, r2h, lbl_col);
         user_ta_ = textarea(card, "username", 48, r2y, 115, r2h, false);
-        label(card, t(TextKey::Password), 170, r2y + 3, 36, r2h, lbl_col);
+        label(card, t(TextKey::Password), 170, r2y + 5, 36, r2h, lbl_col);
         pass_ta_ = textarea(card, "password", 206, r2y, 96, r2h, true);
 
-        /* Buttons. */
-        int r3y = 100, r3h = 22;
-        login_btn_ = text_button(card, t(TextKey::Login), 12, r3y, 132, r3h, lv_color_hex(0xFFFFFF));
-        scan_btn_ = text_button(card, t(TextKey::ScanLan), 170, r3y + 1, 132, r3h - 2, lv_color_hex(0x556677));
-
-        /* Status bar. */
-        status_ = label(card, "", 12, 127, 290, 14, lv_color_hex(0xFF9B9B), ui_font_14());
+        /* Status sits between the form rows and the actions so error text never
+         * forces a large empty strip below the buttons. */
+        status_ = label(card, "", 12, 100, 290, 14, lv_color_hex(0xFF9B9B), ui_font_14());
         lv_obj_add_flag(status_, LV_OBJ_FLAG_HIDDEN);
+
+        /* Buttons anchored near the bottom of the card. */
+        int r3y = 118, r3h = 34;
+        login_btn_ = text_button(card, t(TextKey::Login), 12, r3y, 132, r3h, lv_color_hex(0xFFFFFF));
+        scan_btn_ = text_button(card, t(TextKey::ScanLan), 164, r3y, 138, r3h, lv_color_hex(0x607080));
 
         if (!config_.base_url.empty()) lv_textarea_set_text(url_ta_, config_.base_url.c_str());
         if (!config_.username.empty()) lv_textarea_set_text(user_ta_, config_.username.c_str());
         if (!config_.password.empty()) lv_textarea_set_text(pass_ta_, config_.password.c_str());
-        lv_group_focus_obj(server_dropdown_);
-        update_setup_focus_marker();
+
+        /* Restore the control that triggered this rebuild (server/language toggles),
+         * otherwise Enter on the language chip would jump back to Jellyfin. */
+        SetupFocusTarget focus_target = requested_setup_focus_;
+        requested_setup_focus_ = SetupFocusTarget::None;
+        lv_obj_t *initial_focus = server_jf_btn_;
+        switch (focus_target) {
+            case SetupFocusTarget::ServerEB: initial_focus = server_eb_btn_; break;
+            case SetupFocusTarget::Language: initial_focus = lang_switch_; break;
+            case SetupFocusTarget::Url: initial_focus = url_ta_; break;
+            case SetupFocusTarget::User: initial_focus = user_ta_; break;
+            case SetupFocusTarget::Pass: initial_focus = pass_ta_; break;
+            case SetupFocusTarget::Login: initial_focus = login_btn_; break;
+            case SetupFocusTarget::Scan: initial_focus = scan_btn_; break;
+            case SetupFocusTarget::None:
+            case SetupFocusTarget::ServerJF:
+            default:
+                initial_focus = server_jf_btn_;
+                break;
+        }
+        if (initial_focus) lv_group_focus_obj(initial_focus);
     }
 
     void show_loading(const std::string &text)
@@ -5166,18 +5249,40 @@ private:
     void toggle_server_type()
     {
         config_.type = config_.type == ServerType::Emby ? ServerType::Jellyfin : ServerType::Emby;
+        request_setup_focus(config_.type == ServerType::Jellyfin
+                                ? SetupFocusTarget::ServerJF
+                                : SetupFocusTarget::ServerEB);
         save_config(config_);
         show_setup();
     }
 
     void toggle_language()
     {
+        request_setup_focus(SetupFocusTarget::Language);
         UiLanguage lang = current_language();
         if (lang == UiLanguage::English) config_.language = "zh-CN";
         else if (lang == UiLanguage::Chinese) config_.language = "ja-JP";
         else config_.language = "en";
         save_config(config_);
         show_setup();
+    }
+
+    /* Focus-target enum — defined early so toggle/click handlers can refer to it. */
+    enum class SetupFocusTarget {
+        None,
+        ServerJF,
+        ServerEB,
+        Language,
+        Url,
+        User,
+        Pass,
+        Login,
+        Scan
+    };
+
+    void request_setup_focus(SetupFocusTarget target)
+    {
+        requested_setup_focus_ = target;
     }
 
     void start_lan_scan()
@@ -7312,46 +7417,37 @@ private:
     {
         lv_obj_t *focused = focused_obj();
 
-        if ((key == LV_KEY_ESC) &&
-            ((server_dropdown_ && lv_dropdown_is_open(server_dropdown_)) ||
-             (language_dropdown_ && lv_dropdown_is_open(language_dropdown_)))) {
-            if (server_dropdown_ && lv_dropdown_is_open(server_dropdown_)) lv_dropdown_close(server_dropdown_);
-            if (language_dropdown_ && lv_dropdown_is_open(language_dropdown_)) lv_dropdown_close(language_dropdown_);
+        if (key == LV_KEY_ESC) {
             return;
         }
 
         if (key == LV_KEY_NEXT || key == LV_KEY_DOWN || key == '\t') {
             if (group_) lv_group_focus_next(group_);
-            update_setup_focus_marker();
             return;
         }
         if (key == LV_KEY_PREV || key == LV_KEY_UP) {
             if (group_) lv_group_focus_prev(group_);
-            update_setup_focus_marker();
             return;
         }
-        if ((key == LV_KEY_LEFT || key == LV_KEY_RIGHT) && focused == server_dropdown_) {
+        if ((key == LV_KEY_LEFT || key == LV_KEY_RIGHT) && (focused == server_jf_btn_ || focused == server_eb_btn_)) {
             toggle_server_type();
             return;
         }
-        if ((key == LV_KEY_LEFT || key == LV_KEY_RIGHT) && focused == language_dropdown_) {
+        if ((key == LV_KEY_LEFT || key == LV_KEY_RIGHT) && focused == lang_switch_) {
             toggle_language();
             return;
         }
         if (key == LV_KEY_ENTER) {
-            if (focused == server_dropdown_) {
-                if (lv_dropdown_is_open(server_dropdown_)) return;
-                lv_dropdown_open(server_dropdown_);
-            } else if (focused == language_dropdown_) {
-                if (lv_dropdown_is_open(language_dropdown_)) return;
-                lv_dropdown_open(language_dropdown_);
+            if (focused == server_jf_btn_ || focused == server_eb_btn_) {
+                toggle_server_type();
+            } else if (focused == lang_switch_) {
+                toggle_language();
             } else if (focused == login_btn_ || focused == pass_ta_) {
                 login_from_setup();
             } else if (focused == scan_btn_) {
                 start_lan_scan();
             } else {
                 if (group_) lv_group_focus_next(group_);
-                update_setup_focus_marker();
             }
         }
     }
@@ -7816,13 +7912,16 @@ private:
     lv_obj_t *language_dropdown_ = nullptr;
     lv_obj_t *login_btn_ = nullptr;
     lv_obj_t *logout_btn_ = nullptr;
+    lv_obj_t *server_jf_btn_ = nullptr;
+    lv_obj_t *server_eb_btn_ = nullptr;
+    lv_obj_t *lang_switch_ = nullptr;
     lv_obj_t *scan_btn_ = nullptr;
     lv_obj_t *small_screen_btn_ = nullptr;
     lv_obj_t *url_ta_ = nullptr;
     lv_obj_t *user_ta_ = nullptr;
     lv_obj_t *pass_ta_ = nullptr;
     lv_obj_t *status_ = nullptr;
-    lv_obj_t *setup_focus_marker_ = nullptr;
+    SetupFocusTarget requested_setup_focus_ = SetupFocusTarget::None;
     std::vector<LanServer> lan_servers_;
     size_t lan_hosts_selected_ = 0;
     lv_timer_t *player_timer_ = nullptr;
