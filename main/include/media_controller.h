@@ -13,6 +13,7 @@ extern "C" {
 
 void media_controller_init(void);
 void media_controller_attach_keyboard(lv_indev_t *preferred);
+void media_controller_shutdown(void);
 
 #ifdef __cplusplus
 }

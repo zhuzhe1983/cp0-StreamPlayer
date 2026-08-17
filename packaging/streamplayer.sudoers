@@ -1,0 +1,2 @@
+# Root-owned guards restore services even if StreamPlayer crashes or is OOM-killed.
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start streamplayer-background-guard.service, /usr/bin/systemctl start streamplayer-display-guard.service

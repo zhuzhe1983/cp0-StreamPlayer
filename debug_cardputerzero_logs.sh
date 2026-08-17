@@ -5,17 +5,26 @@ CONFIG="${M5_STREAMPLAYER_CONFIG:-/home/pi/.config/m5streamplayer/config.ini}"
 APP_LOG="${M5_STREAMPLAYER_APP_LOG:-/tmp/m5streamplayer-app.log}"
 PLAYER_LOG="${M5_STREAMPLAYER_PLAYER_LOG:-/tmp/m5streamplayer-player.log}"
 CONTROL_FIFO="${M5_STREAMPLAYER_CONTROL:-/tmp/m5streamplayer-control}"
+POSTER_CACHE="${M5_STREAMPLAYER_CACHE_DIR:-/home/pi/.cache/m5streamplayer}/posters"
 
 redact() {
-    sed -E 's/(api_key=)[^&[:space:]]+/\1<redacted>/g; s/(X-Emby-Token: )[^\r[:space:]]+/\1<redacted>/g'
+    sed -E \
+        -e 's/([Aa][Pp][Ii]_[Kk][Ee][Yy]"?(=|%3[Dd]|:[[:space:]]*"?))[^&[:space:]",}]+/\1<redacted>/g' \
+        -e 's/([Aa][Cc][Cc][Ee][Ss][Ss][Tt][Oo][Kk][Ee][Nn]"?(=|%3[Dd]|:[[:space:]]*"?))[^&[:space:]",}]+/\1<redacted>/g' \
+        -e 's/([Xx]-[Ee][Mm][Bb][Yy]-[Tt][Oo][Kk][Ee][Nn]"?(=|%3[Dd]|:[[:space:]]*"?))[^&[:space:]",}]+/\1<redacted>/g'
 }
 
 print_state() {
     echo "== process =="
-    ps -eo pid,user,ppid,stat,lstart,args | grep -E 'M5CardputerZero|ffplay|ffmpeg|vlc|mpv' | grep -v grep || true
+    ps -eo pid,user,ppid,stat,lstart,comm |
+        grep -E 'M5CardputerZero|gst-launch-1.0|ffplay|ffmpeg|vlc|mpv' |
+        grep -v grep || true
     echo
     echo "== control fifo =="
     ls -l "$CONTROL_FIFO" 2>/dev/null || echo "missing $CONTROL_FIFO"
+    echo
+    echo "== poster cache =="
+    ls -l "$POSTER_CACHE" 2>/dev/null | head -n 20 || echo "missing $POSTER_CACHE"
     echo
     echo "== audio sinks =="
     wpctl status 2>/dev/null | sed -n '/Sinks:/,/Sources:/p' | head -n 30 || true
@@ -36,6 +45,7 @@ print_state() {
                 -H "X-Emby-Token: $token" \
                 "$base/Sessions" 2>/dev/null |
                 tr '{' '\n' |
+                redact |
                 grep -E 'M5CardputerZero|NowPlayingItem|TranscodingInfo|PlayMethod|VideoCodec|AudioCodec|TranscodeReasons' |
                 head -n 80 || true
             echo
@@ -65,8 +75,11 @@ case "${1:-tail}" in
         : > "$PLAYER_LOG"
         echo "cleared $APP_LOG and $PLAYER_LOG"
         ;;
+    redact)
+        redact
+        ;;
     *)
-        echo "usage: $0 [tail|once|clear]" >&2
+        echo "usage: $0 [tail|once|clear|redact]" >&2
         exit 2
         ;;
 esac

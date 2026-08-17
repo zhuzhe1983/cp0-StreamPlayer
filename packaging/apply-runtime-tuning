@@ -1,0 +1,177 @@
+#!/bin/sh
+set -eu
+
+mode=${1:-apply}
+state_dir=${STREAMPLAYER_STATE_DIR:-/var/lib/streamplayer}
+sys_class_net=${STREAMPLAYER_SYS_CLASS_NET:-/sys/class/net}
+lock_file=${STREAMPLAYER_TUNING_LOCK:-/run/lock/streamplayer-tuning.lock}
+
+case "${mode}" in
+    apply|restore) ;;
+    *)
+        printf '%s\n' "usage: $0 [apply|restore]" >&2
+        exit 2
+        ;;
+esac
+
+if [ -n "${STREAMPLAYER_IW_COMMAND:-}" ]; then
+    iw_command=${STREAMPLAYER_IW_COMMAND}
+else
+    iw_command=$(command -v iw 2>/dev/null || true)
+    if [ -z "${iw_command}" ] && [ -x /usr/sbin/iw ]; then
+        iw_command=/usr/sbin/iw
+    fi
+fi
+
+if [ -z "${iw_command}" ] || [ ! -x "${iw_command}" ]; then
+    if [ "${mode}" = restore ] &&
+       find "${state_dir}" -maxdepth 1 -type f -name 'wifi-power-save.*' \
+           -print -quit 2>/dev/null | grep -q .; then
+        printf '%s\n' "streamplayer: iw is unavailable; Wi-Fi state was not restored" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+mkdir -p "$(dirname "${lock_file}")"
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"${lock_file}"
+    flock -x 9
+else
+    lock_directory="${lock_file}.d"
+    lock_attempt=0
+    while ! mkdir "${lock_directory}" 2>/dev/null; do
+        lock_attempt=$((lock_attempt + 1))
+        if [ "${lock_attempt}" -ge 200 ]; then
+            printf '%s\n' "streamplayer: timed out waiting for the tuning lock" >&2
+            exit 1
+        fi
+        sleep 0.05
+    done
+    trap 'rmdir "${lock_directory}" 2>/dev/null || true' EXIT HUP INT TERM
+fi
+
+power_save_state()
+{
+    "${iw_command}" dev "$1" get power_save 2>/dev/null |
+        awk '/Power save:/ { print $3; exit }'
+}
+
+record_original_state()
+{
+    state_file=$1
+    original_state=$2
+    temporary_file=$(mktemp "${state_file}.tmp.XXXXXX")
+    printf '%s\n' "${original_state}" > "${temporary_file}"
+    chmod 0600 "${temporary_file}"
+    if [ ! -e "${state_file}" ]; then
+        mv -- "${temporary_file}" "${state_file}"
+    else
+        rm -f -- "${temporary_file}"
+    fi
+}
+
+apply_tuning()
+{
+    apply_status=0
+    mkdir -p "${state_dir}"
+    chmod 0700 "${state_dir}"
+    for wireless_path in "${sys_class_net}"/*/wireless; do
+        [ -d "${wireless_path}" ] || continue
+        interface_name=$(basename "$(dirname "${wireless_path}")")
+        state_file="${state_dir}/wifi-power-save.${interface_name}"
+        if [ ! -f "${state_file}" ]; then
+            original_state=$(power_save_state "${interface_name}")
+            case "${original_state}" in
+                on|off)
+                    record_original_state "${state_file}" "${original_state}"
+                    ;;
+                *)
+                    printf '%s\n' \
+                        "streamplayer: could not record Wi-Fi state for ${interface_name}" >&2
+                    apply_status=1
+                    continue
+                    ;;
+            esac
+        fi
+        if ! "${iw_command}" dev "${interface_name}" \
+                set power_save off 2>/dev/null; then
+            printf '%s\n' \
+                "streamplayer: failed to disable Wi-Fi power saving for ${interface_name}" >&2
+            apply_status=1
+            continue
+        fi
+        if [ "$(power_save_state "${interface_name}")" != off ]; then
+            printf '%s\n' \
+                "streamplayer: Wi-Fi power saving remained enabled for ${interface_name}" >&2
+            apply_status=1
+        fi
+    done
+    return "${apply_status}"
+}
+
+restore_tuning()
+{
+    restore_status=0
+    for state_file in "${state_dir}"/wifi-power-save.*; do
+        [ -f "${state_file}" ] || continue
+        interface_name=${state_file#"${state_dir}/wifi-power-save."}
+        original_state=$(sed -n '1p' "${state_file}")
+        case "${original_state}" in
+            on|off) ;;
+            *)
+                printf '%s\n' \
+                    "streamplayer: invalid Wi-Fi state for ${interface_name}" >&2
+                restore_status=1
+                continue
+                ;;
+        esac
+
+        if [ ! -d "${sys_class_net}/${interface_name}/wireless" ]; then
+            printf '%s\n' \
+                "streamplayer: Wi-Fi interface ${interface_name} is unavailable; retry removal later" >&2
+            restore_status=1
+            continue
+        fi
+
+        current_state=$(power_save_state "${interface_name}")
+        case "${current_state}" in
+            on|off) ;;
+            *)
+                printf '%s\n' \
+                    "streamplayer: could not read Wi-Fi state for ${interface_name}" >&2
+                restore_status=1
+                continue
+                ;;
+        esac
+
+        if [ "${current_state}" = "${original_state}" ]; then
+            rm -f -- "${state_file}"
+        elif [ "${current_state}" = off ]; then
+            if "${iw_command}" dev "${interface_name}" \
+                    set power_save "${original_state}" 2>/dev/null; then
+                rm -f -- "${state_file}"
+            else
+                printf '%s\n' \
+                    "streamplayer: failed to restore Wi-Fi state for ${interface_name}" >&2
+                restore_status=1
+            fi
+        else
+            printf '%s\n' \
+                "streamplayer: Wi-Fi state changed externally; leaving ${interface_name} untouched" >&2
+            rm -f -- "${state_file}"
+        fi
+    done
+    return "${restore_status}"
+}
+
+case "${mode}" in
+    apply)
+        apply_tuning
+        ;;
+    restore)
+        restore_tuning
+        ;;
+esac
+
+exit 0

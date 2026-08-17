@@ -1,6 +1,7 @@
 # Build outputs
 /build/
 /dist/
+/artifacts/
 /static_lib
 
 # Runtime/generated cache
@@ -29,4 +30,3 @@ __pycache__/
 .vscode/
 *.swp
 *.swo
-

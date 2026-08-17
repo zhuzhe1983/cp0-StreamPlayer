@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+if [ "${1:-}" = purge ] &&
+   [ ! -e /var/lib/streamplayer/restore-conflict ] &&
+   [ ! -e /var/lib/streamplayer/restore-failed ] &&
+   [ ! -e /var/lib/streamplayer/cma-original-line ] &&
+   [ ! -e /var/lib/streamplayer/cma-applied-line ]; then
+    rm -f -- \
+        /var/lib/streamplayer/config.txt.before-streamplayer \
+        /var/lib/streamplayer/cma-replacement-line
+    rmdir /var/lib/streamplayer 2>/dev/null || true
+fi
+
+exit 0

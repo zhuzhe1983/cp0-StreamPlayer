@@ -4,6 +4,7 @@
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include "ui/ui.h"
 #include "keyboard_input.h"
 #include "media_controller.h"
@@ -13,13 +14,20 @@
 #include <cstring>
 
 static lv_indev_t *g_keyboard_indev = NULL;
+static volatile sig_atomic_t g_shutdown_requested = 0;
+
+static void request_shutdown(int signal_number)
+{
+    (void)signal_number;
+    g_shutdown_requested = 1;
+}
 
 static const char *getenv_default(const char *name, const char *dflt)
 {
     return getenv(name) ?: dflt;
 }
 
-int get_st7789v_fbdev(char *dev_path, size_t buf_size)
+int get_cardputer_fbdev(char *dev_path, size_t buf_size)
 {
     if (dev_path == NULL || buf_size == 0)
     {
@@ -34,25 +42,48 @@ int get_st7789v_fbdev(char *dev_path, size_t buf_size)
     }
 
     char line[256];
-    int fb_num = -1;
+    int preferred_fb_num = -1;
+    int fallback_fb_num = -1;
+    int framebuffer_count = 0;
 
-    /* 逐行读取，查找包含 fb_st7789v 的行，格式如：0 fb_st7789v */
+    /*
+     * The legacy image reports "fb_st7789v"; newer CardputerZero images use
+     * "panel-mipi-dbid". Prefer either known LCD driver, and only fall back
+     * to an unnamed framebuffer when the system exposes exactly one.
+     */
     while (fgets(line, sizeof(line), fp) != NULL)
     {
-        if (strstr(line, "fb_st7789v") != NULL)
+        int fb_num = -1;
+        char driver_name[128] = {0};
+        if (sscanf(line, "%d %127s", &fb_num, driver_name) != 2)
         {
-            if (sscanf(line, "%d", &fb_num) == 1)
-            {
-                break;
-            }
+            continue;
+        }
+
+        if (framebuffer_count == 0)
+        {
+            fallback_fb_num = fb_num;
+        }
+        framebuffer_count++;
+
+        if (strcmp(driver_name, "fb_st7789v") == 0 ||
+            strcmp(driver_name, "panel-mipi-dbid") == 0)
+        {
+            preferred_fb_num = fb_num;
+            break;
         }
     }
 
     fclose(fp);
 
+    int fb_num = preferred_fb_num;
+    if (fb_num < 0 && framebuffer_count == 1)
+    {
+        fb_num = fallback_fb_num;
+    }
     if (fb_num < 0)
     {
-        fprintf(stderr, "fb_st7789v not found in /proc/fb\n");
+        fprintf(stderr, "CardputerZero framebuffer not found in /proc/fb\n");
         return -1;
     }
 
@@ -177,9 +208,14 @@ static void lv_linux_disp_init(void)
     const char *device = NULL;
     char fbdev[64] = {0};
     device = getenv_default("LV_LINUX_FBDEV_DEVICE", NULL);
-    if ((device == NULL) && (get_st7789v_fbdev(fbdev, sizeof(fbdev)) == 0))
+    if ((device == NULL) && (get_cardputer_fbdev(fbdev, sizeof(fbdev)) == 0))
     {
         device = fbdev;
+    }
+    if (device == NULL)
+    {
+        fprintf(stderr, "No framebuffer device available\n");
+        return;
     }
     printf("Using framebuffer device: %s\n", device);
     lv_display_t *disp = lv_linux_fbdev_create();
@@ -231,6 +267,12 @@ static void lv_linux_indev_init(void)
 
 int main(void)
 {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = request_shutdown;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
 
     lv_init();
 
@@ -249,11 +291,12 @@ int main(void)
     // lv_demo_widgets(); // 用LVGL自带demo测试
     /*Handle LVGL tasks*/
     printf("Entering main loop...\n");
-    while (1)
+    while (!g_shutdown_requested)
     {
         lv_timer_handler();
         usleep(1000);
     }
 
+    media_controller_shutdown();
     return 0;
 }

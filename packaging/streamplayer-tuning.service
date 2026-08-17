@@ -1,0 +1,11 @@
+[Unit]
+Description=StreamPlayer hardware and network runtime tuning
+After=NetworkManager.service network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/streamplayer/apply-runtime-tuning
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

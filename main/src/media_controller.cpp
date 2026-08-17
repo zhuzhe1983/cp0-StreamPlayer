@@ -1,4 +1,6 @@
 #include "media_controller.h"
+#include "hls_seek.h"
+#include "lan_scan.h"
 #include "ui/ui.h"
 
 #include "lvgl/src/libs/tiny_ttf/lv_tiny_ttf.h"
@@ -13,11 +15,13 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
+#include <grp.h>
 #include <sstream>
 #include <string>
 #include <signal.h>
 #include <ctime>
 #include <pwd.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -30,16 +34,26 @@ namespace {
 constexpr int kScreenW = 320;
 constexpr int kScreenH = 170;
 constexpr int kTopY = 22;
-constexpr const char *kAppVersion = "0.1.0";
+constexpr const char *kAppVersion = "0.1.0-m5stack16";
 constexpr const char *kDeviceId = "m5cardputerzero";
 constexpr const char *kMpvSocket = "/tmp/m5cardputer-streamplayer-mpv.sock";
 constexpr const char *kControlPipe = "/tmp/m5streamplayer-control";
+constexpr const char *kPlayerLog = "/tmp/m5streamplayer-player.log";
+constexpr long long kGstreamerBufferDurationNs = 9000000000LL;
+constexpr int kGstreamerBufferSizeBytes = 4 * 1024 * 1024;
+constexpr uint64_t kPlayerStartupTimeoutMs = 60000;
 constexpr int kItemsPageSize = 24;
 constexpr int kLazyLoadThreshold = 5;
 constexpr int kTranscodeMaxWidth = 1920;
 constexpr int kTranscodeMaxHeight = 1080;
-constexpr int kTranscodeMaxFramerate = 30;
-constexpr int kTranscodeVideoBitrate = 5000000;
+constexpr int kTranscodeMaxFramerate = 24;
+/*
+ * Emby treats VideoBitrate as both a bandwidth ceiling and a resolution
+ * quality hint.  At 3.0 Mbps it negotiates 1280x720 even when MaxWidth and
+ * MaxHeight advertise 1920x1080.  3.8 Mbps is the lowest verified threshold
+ * that keeps the server-side HLS rendition at 1920x1080 on the target setup.
+ */
+constexpr int kTranscodeVideoBitrate = 3800000;
 constexpr int kTranscodeAudioBitrate = 128000;
 constexpr int kTranscodeMaxBitrate = kTranscodeVideoBitrate + kTranscodeAudioBitrate;
 constexpr int kSmallScreenTranscodeMaxWidth = 320;
@@ -47,21 +61,23 @@ constexpr int kSmallScreenTranscodeMaxHeight = 170;
 constexpr int kSmallScreenTranscodeVideoBitrate = 500000;
 constexpr int kSmallScreenTranscodeMaxBitrate = kSmallScreenTranscodeVideoBitrate + kTranscodeAudioBitrate;
 constexpr size_t kNoStream = static_cast<size_t>(-1);
-constexpr const char *kDefaultServerUrl = "";
-constexpr const char *kServerUrlPlaceholder = "server URL";
+constexpr const char *kServerUrlEnv = "M5_STREAMPLAYER_BASE_URL";
+constexpr const char *kUsernameEnv = "M5_STREAMPLAYER_USERNAME";
+constexpr const char *kPasswordEnv = "M5_STREAMPLAYER_PASSWORD";
+constexpr const char *kServerUrlPlaceholder = "http://192.168.x.x:8096";
 constexpr const char *kRecentPlayedLibraryId = "__m5_recent_played";
 constexpr const char *kRecentPlayedLibraryType = "recentplayed";
 constexpr const char *kSettingsLibraryId = "__m5_settings";
 constexpr const char *kSettingsLibraryType = "settings";
 
 enum class ServerType { Jellyfin, Emby };
-enum class UiLanguage { English, Chinese };
-enum class View { Setup, Loading, Browse, Detail, Player, Sort, Settings, Search, Error };
+enum class UiLanguage { English, Chinese, Japanese };
+enum class View { Setup, Loading, Browse, Detail, Player, Sort, Settings, Search, Error, LanHosts };
 enum class SortMode { LatestUpdated, Name, PremiereDate, Runtime, Unwatched };
 enum class AudioOutput { Speaker, Headphone, Bluetooth, Hdmi };
 
 struct ServerConfig {
-    ServerType type = ServerType::Jellyfin;
+    ServerType type = ServerType::Emby;
     std::string base_url;
     std::string username;
     std::string password;
@@ -104,6 +120,8 @@ struct MediaItem {
     std::string primary_image_tag;
     std::string thumb_image_tag;
     std::string backdrop_image_tag;
+    std::string thumb_item_id;
+    std::string backdrop_item_id;
     int production_year = 0;
     int index_number = 0;
     int parent_index_number = 0;
@@ -171,15 +189,23 @@ static std::string to_lower(std::string s)
 static UiLanguage language_from_code(std::string value)
 {
     value = to_lower(trim(value));
-    if (value.find("zh") == 0 || value.find("chinese") == 0 || value == "cn") {
-        return UiLanguage::Chinese;
-    }
+    if (value.find("ja") == 0 || value.find("japanese") == 0 || value == "jp") return UiLanguage::Japanese;
+    if (value.find("zh") == 0 || value.find("chinese") == 0 || value == "cn") return UiLanguage::Chinese;
     return UiLanguage::English;
 }
 
 static const char *language_code(UiLanguage language)
 {
-    return language == UiLanguage::Chinese ? "zh-CN" : "en";
+    if (language == UiLanguage::Chinese) return "zh-CN";
+    if (language == UiLanguage::Japanese) return "ja-JP";
+    return "en";
+}
+
+static UiLanguage language_from_selected(uint32_t selected)
+{
+    if (selected == 1) return UiLanguage::Chinese;
+    if (selected == 2) return UiLanguage::Japanese;
+    return UiLanguage::English;
 }
 
 static std::string system_language_code()
@@ -369,14 +395,32 @@ static std::string ensure_api_key(std::string url, const std::string &token)
 
 static std::string redact_query_secret(std::string text)
 {
-    const char *keys[] = {"api_key=", "X-Emby-Token=", "AccessToken="};
+    const char *keys[] = {"api_key", "x-emby-token", "accesstoken"};
     for (const char *key : keys) {
         size_t pos = 0;
-        while ((pos = text.find(key, pos)) != std::string::npos) {
-            size_t value = pos + strlen(key);
-            size_t end = text.find_first_of("& \r\n\t", value);
+        std::string lowered = to_lower(text);
+        while ((pos = lowered.find(key, pos)) != std::string::npos) {
+            size_t separator = pos + strlen(key);
+            if (separator < lowered.size() && lowered[separator] == '"') separator++;
+            size_t value = separator;
+            if (lowered.compare(separator, 3, "%3d") == 0) {
+                value += 3;
+            } else if (separator < lowered.size() &&
+                       (lowered[separator] == '=' || lowered[separator] == ':')) {
+                value++;
+            } else {
+                pos = separator;
+                continue;
+            }
+            while (value < text.size() &&
+                   (std::isspace(static_cast<unsigned char>(text[value])) ||
+                    text[value] == '"' || text[value] == '\'')) {
+                value++;
+            }
+            size_t end = text.find_first_of("& \r\n\t\"',}", value);
             if (end == std::string::npos) end = text.size();
             text.replace(value, end - value, "<redacted>");
+            lowered = to_lower(text);
             pos = value + 10;
         }
     }
@@ -385,8 +429,16 @@ static std::string redact_query_secret(std::string text)
 
 static void app_log(const std::string &message)
 {
-    FILE *file = fopen("/tmp/m5streamplayer-app.log", "a");
-    if (!file) return;
+    int log_fd = open("/tmp/m5streamplayer-app.log",
+                      O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW,
+                      0600);
+    if (log_fd < 0) return;
+    FILE *file = fdopen(log_fd, "a");
+    if (!file) {
+        close(log_fd);
+        return;
+    }
+    fchmod(fileno(file), 0600);
     time_t now = time(nullptr);
     struct tm tm_now {};
     localtime_r(&now, &tm_now);
@@ -447,12 +499,55 @@ static std::string audio_output_pulse_sink(AudioOutput output)
         : "alsa_output.platform-sound.stereo-fallback";
 }
 
+static std::string detected_alsa_output_device(bool want_hdmi)
+{
+    DIR *dir = opendir("/proc/asound");
+    if (dir) {
+        std::string fallback_card;
+        struct dirent *entry = nullptr;
+        while ((entry = readdir(dir)) != nullptr) {
+            const char *name = entry->d_name;
+            if (strncmp(name, "card", 4) != 0 || !std::isdigit(static_cast<unsigned char>(name[4]))) {
+                continue;
+            }
+
+            std::ifstream id_file(std::string("/proc/asound/") + name + "/id");
+            std::string card_id;
+            if (!std::getline(id_file, card_id)) continue;
+            card_id = trim(card_id);
+            if (card_id.empty()) continue;
+
+            const std::string lowered = to_lower(card_id);
+            const bool is_hdmi = lowered.find("hdmi") != std::string::npos;
+            if (is_hdmi != want_hdmi) continue;
+            if (fallback_card.empty()) fallback_card = card_id;
+            if (is_hdmi || lowered.find("audio") != std::string::npos) {
+                closedir(dir);
+                return "default:CARD=" + card_id;
+            }
+        }
+        closedir(dir);
+        if (!fallback_card.empty()) return "default:CARD=" + fallback_card;
+    }
+
+    return "default";
+}
+
 static std::string local_alsa_output_device()
 {
     const char *override = getenv("M5_SMALL_SCREEN_ALSA_DEVICE");
     if (!override || !*override) override = getenv("M5_AUDIO_ALSA_DEVICE");
     if (override && *override) return override;
-    return "default:CARD=ES8388Audio";
+    return detected_alsa_output_device(false);
+}
+
+static std::string alsa_output_device(AudioOutput output)
+{
+    if (output == AudioOutput::Hdmi) {
+        const char *override = getenv("M5_AUDIO_HDMI_ALSA_DEVICE");
+        return (override && *override) ? override : detected_alsa_output_device(true);
+    }
+    return local_alsa_output_device();
 }
 
 static const char *audio_output_wpctl_pattern(AudioOutput output)
@@ -574,6 +669,7 @@ static void ensure_config_dir()
     size_t slash = dir.find_last_of('/');
     if (slash != std::string::npos) mkdir(dir.substr(0, slash).c_str(), 0755);
     mkdir(dir.c_str(), 0755);
+    chmod(dir.c_str(), 0700);
 
     if (dir.find("/home/pi/") == 0) {
         struct passwd *pi = getpwnam("pi");
@@ -589,6 +685,134 @@ static void ensure_pi_owner(const std::string &path)
     if (path.find("/home/pi/") != 0) return;
     struct passwd *pi = getpwnam("pi");
     if (pi) chown(path.c_str(), pi->pw_uid, pi->pw_gid);
+}
+
+static std::string cache_dir()
+{
+    const char *override = getenv("M5_STREAMPLAYER_CACHE_DIR");
+    if (override && *override) return override;
+
+    struct stat pi_home {};
+    if (stat("/home/pi", &pi_home) == 0 && S_ISDIR(pi_home.st_mode)) {
+        return "/home/pi/.cache/m5streamplayer";
+    }
+
+    const char *home = getenv("HOME");
+    std::string root = home ? home : "/tmp";
+    return root + "/.cache/m5streamplayer";
+}
+
+static std::string poster_cache_dir()
+{
+    return cache_dir() + "/posters";
+}
+
+static bool file_nonempty(const std::string &path)
+{
+    struct stat st {};
+    return !path.empty() && stat(path.c_str(), &st) == 0 && st.st_size > 0;
+}
+
+static bool file_has_png_signature(const std::string &path)
+{
+    if (path.empty()) return false;
+    std::ifstream in(path.c_str(), std::ios::binary);
+    if (!in) return false;
+    unsigned char header[8] = {};
+    in.read(reinterpret_cast<char *>(header), sizeof(header));
+    if (in.gcount() < static_cast<std::streamsize>(sizeof(header))) return false;
+    const unsigned char png_sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    return memcmp(header, png_sig, sizeof(png_sig)) == 0;
+}
+
+static bool mkdir_owned(const std::string &dir, mode_t mode)
+{
+    if (dir.empty()) return false;
+    if (mkdir(dir.c_str(), mode) != 0 && errno != EEXIST) {
+        app_log(std::string("cache mkdir failed dir=") + dir + " err=" + strerror(errno));
+        return false;
+    }
+    chmod(dir.c_str(), mode);
+    ensure_pi_owner(dir);
+    return true;
+}
+
+static bool ensure_poster_cache_dir(std::string &dir)
+{
+    dir = poster_cache_dir();
+    const std::string root = cache_dir();
+    const size_t slash = root.find_last_of('/');
+    if (slash != std::string::npos && slash > 0) {
+        mkdir_owned(root.substr(0, slash), 0755);
+    }
+    if (!mkdir_owned(root, 0700)) return false;
+    if (!mkdir_owned(dir, 0700)) return false;
+    return true;
+}
+
+static bool convert_image_to_png(const std::string &path)
+{
+    if (file_has_png_signature(path)) return true;
+    if (!command_exists("ffmpeg")) {
+        app_log("poster not png and ffmpeg missing path=" + path);
+        return false;
+    }
+
+    const std::string tmp = path + ".cvt.png";
+    const std::string cmd = "ffmpeg -y -hide_banner -loglevel error -i " +
+                            shell_quote(path) + " -frames:v 1 " + shell_quote(tmp) +
+                            " >/dev/null 2>&1";
+    if (system(cmd.c_str()) != 0 || !file_has_png_signature(tmp)) {
+        unlink(tmp.c_str());
+        app_log("poster png convert failed path=" + path);
+        return false;
+    }
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        unlink(tmp.c_str());
+        app_log(std::string("poster png convert rename failed path=") + path +
+                " err=" + strerror(errno));
+        return false;
+    }
+    ensure_pi_owner(path);
+    return true;
+}
+
+static bool download_cached_image(const std::string &url,
+                                  const std::string &path,
+                                  const std::string &context)
+{
+    const std::string tmp = path + ".tmp";
+    const std::string cmd = "curl -fsSL --connect-timeout 5 --max-time 15 -o " +
+                            shell_quote(tmp) + " " + shell_quote(url) +
+                            " >/dev/null 2>&1";
+    const int rc = system(cmd.c_str());
+    if (rc != 0) {
+        unlink(tmp.c_str());
+        app_log("poster download failed " + context +
+                " rc=" + std::to_string(rc) + " url=" + url);
+        return false;
+    }
+    struct stat tmp_st {};
+    if (stat(tmp.c_str(), &tmp_st) != 0 || tmp_st.st_size <= 0) {
+        unlink(tmp.c_str());
+        app_log("poster download empty " + context + " url=" + url);
+        return false;
+    }
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        unlink(tmp.c_str());
+        app_log(std::string("poster rename failed ") + context +
+                " path=" + path + " err=" + strerror(errno));
+        return false;
+    }
+    ensure_pi_owner(path);
+    if (!convert_image_to_png(path)) {
+        unlink(path.c_str());
+        return false;
+    }
+    app_log("poster cached " + context +
+            " bytes=" + std::to_string(static_cast<long long>(tmp_st.st_size)) +
+            " path=" + path);
+    return true;
 }
 
 static std::string ini_get(const std::string &content, const std::string &key)
@@ -607,10 +831,13 @@ static bool load_config(ServerConfig &cfg)
 {
     std::ifstream in(config_path().c_str());
     if (!in) return false;
+    chmod(config_path().c_str(), 0600);
     std::stringstream buffer;
     buffer << in.rdbuf();
     std::string body = buffer.str();
-    cfg.type = (ini_get(body, "server_type") == "emby") ? ServerType::Emby : ServerType::Jellyfin;
+    const std::string server_type = ini_get(body, "server_type");
+    if (server_type == "emby") cfg.type = ServerType::Emby;
+    else if (server_type == "jellyfin") cfg.type = ServerType::Jellyfin;
     cfg.base_url = ini_get(body, "base_url");
     cfg.username = ini_get(body, "username");
     cfg.password = ini_get(body, "password");
@@ -632,6 +859,7 @@ static void save_config(const ServerConfig &cfg)
     out << "language=" << (cfg.language.empty() ? language_code(language_from_code(system_language_code()))
                                                 : cfg.language) << "\n";
     out.close();
+    chmod(config_path().c_str(), 0600);
     ensure_pi_owner(config_path());
 }
 
@@ -843,12 +1071,22 @@ static MediaItem parse_item(const std::string &object)
     item.primary_image_tag = json_get_string(image_tags, "Primary");
     item.thumb_image_tag = json_get_string(image_tags, "Thumb");
     item.backdrop_image_tag = json_get_string(image_tags, "Backdrop");
+    item.thumb_item_id = item.id;
+    item.backdrop_item_id = item.id;
     if (item.primary_image_tag.empty()) item.primary_image_tag = json_get_string(object, "PrimaryImageTag");
     if (item.thumb_image_tag.empty()) item.thumb_image_tag = json_get_string(object, "ThumbImageTag");
-    if (item.thumb_image_tag.empty()) item.thumb_image_tag = json_get_string(object, "ParentThumbImageTag");
     if (item.backdrop_image_tag.empty()) item.backdrop_image_tag = json_get_string(object, "BackdropImageTag");
     if (item.backdrop_image_tag.empty()) item.backdrop_image_tag = json_get_first_array_string(object, "BackdropImageTags");
-    if (item.backdrop_image_tag.empty()) item.backdrop_image_tag = json_get_first_array_string(object, "ParentBackdropImageTags");
+    if (item.thumb_image_tag.empty()) {
+        item.thumb_image_tag = json_get_string(object, "ParentThumbImageTag");
+        item.thumb_item_id = json_get_string(object, "ParentThumbItemId");
+    }
+    if (item.backdrop_image_tag.empty()) {
+        item.backdrop_image_tag = json_get_first_array_string(object, "ParentBackdropImageTags");
+        item.backdrop_item_id = json_get_string(object, "ParentBackdropItemId");
+    }
+    if (item.thumb_item_id.empty()) item.thumb_item_id = item.series_id.empty() ? item.id : item.series_id;
+    if (item.backdrop_item_id.empty()) item.backdrop_item_id = item.series_id.empty() ? item.id : item.series_id;
     item.production_year = static_cast<int>(json_get_int(object, "ProductionYear", 0));
     item.index_number = static_cast<int>(json_get_int(object, "IndexNumber", 0));
     item.parent_index_number = static_cast<int>(json_get_int(object, "ParentIndexNumber", 0));
@@ -890,37 +1128,146 @@ static std::string auth_header()
            std::string(kDeviceId) + "\", Version=\"" + kAppVersion + "\"";
 }
 
+class ScopedTemporaryFile {
+public:
+    ScopedTemporaryFile() = default;
+    ScopedTemporaryFile(const ScopedTemporaryFile &) = delete;
+    ScopedTemporaryFile &operator=(const ScopedTemporaryFile &) = delete;
+
+    ~ScopedTemporaryFile()
+    {
+        cleanup();
+    }
+
+    void adopt(const std::string &path)
+    {
+        cleanup();
+        path_ = path;
+    }
+
+    bool empty() const
+    {
+        return path_.empty();
+    }
+
+    const std::string &path() const
+    {
+        return path_;
+    }
+
+private:
+    void cleanup()
+    {
+        if (path_.empty()) return;
+        if (unlink(path_.c_str()) != 0 && errno != ENOENT) {
+            app_log("Private HTTP body cleanup failed path=" + path_ +
+                    " error=" + strerror(errno));
+        }
+        path_.clear();
+    }
+
+    std::string path_;
+};
+
+static bool write_private_http_body(const std::string &body,
+                                    std::string &path,
+                                    std::string &error)
+{
+    /*
+     * mkstemps creates the file with O_EXCL and mode 0600, so a pre-created
+     * symlink cannot be followed. Keep the explicit fchmod as a defence
+     * against platform-specific implementations and future refactors.
+     */
+    char path_template[] = "/tmp/m5streamplayer-body-XXXXXX.json";
+    int fd = mkstemps(path_template, 5);
+    if (fd < 0) {
+        error = std::string("unable to create private HTTP body: ") + strerror(errno);
+        return false;
+    }
+
+    auto fail = [&](const char *message) {
+        const int saved_errno = errno;
+        close(fd);
+        unlink(path_template);
+        error = std::string(message) + strerror(saved_errno);
+        return false;
+    };
+
+    if (fchmod(fd, 0600) != 0) {
+        return fail("unable to protect private HTTP body: ");
+    }
+    const int descriptor_flags = fcntl(fd, F_GETFD);
+    if (descriptor_flags < 0 ||
+        fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) != 0) {
+        return fail("unable to secure private HTTP body descriptor: ");
+    }
+
+    const char *data = body.data();
+    std::size_t remaining = body.size();
+    while (remaining > 0) {
+        const ssize_t written = write(fd, data, remaining);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            if (written == 0) errno = EIO;
+            return fail("unable to write private HTTP body: ");
+        }
+        data += written;
+        remaining -= static_cast<std::size_t>(written);
+    }
+
+    if (close(fd) != 0) {
+        const int saved_errno = errno;
+        unlink(path_template);
+        error = std::string("unable to close private HTTP body: ") +
+                strerror(saved_errno);
+        return false;
+    }
+
+    path = path_template;
+    return true;
+}
+
 static HttpResponse curl_request(const std::string &method,
                                  const std::string &url,
                                  const std::string &token,
-                                 const std::string &body = "")
+                                 const std::string &body = "",
+                                 int connect_timeout_seconds = 8,
+                                 int max_time_seconds = 35)
 {
     HttpResponse response;
-    std::string body_file;
+    ScopedTemporaryFile body_file;
     if (!body.empty()) {
-        body_file = "/tmp/m5streamplayer-body-" + std::to_string(getpid()) + ".json";
-        std::ofstream out(body_file.c_str(), std::ios::trunc);
-        out << body;
+        std::string body_path;
+        if (!write_private_http_body(body, body_path, response.error)) {
+            app_log("HTTP body staging failed method=" + method +
+                    " url=" + redact_query_secret(url) +
+                    " error=" + response.error);
+            return response;
+        }
+        body_file.adopt(body_path);
     }
 
-    std::string cmd = "curl -fsSL --connect-timeout 8 --max-time 35";
+    std::string cmd = "curl -fsSL --connect-timeout " +
+                      std::to_string(std::max(1, connect_timeout_seconds)) +
+                      " --max-time " +
+                      std::to_string(std::max(1, max_time_seconds));
     cmd += " -X " + shell_quote(method);
     cmd += " -H " + shell_quote("Accept: application/json");
     cmd += " -H " + shell_quote("Content-Type: application/json");
     cmd += " -H " + shell_quote("X-Emby-Authorization: " + auth_header());
     if (!token.empty()) cmd += " -H " + shell_quote("X-Emby-Token: " + token);
-    if (!body_file.empty()) cmd += " --data-binary @" + shell_quote(body_file);
+    if (!body_file.empty()) {
+        cmd += " --data-binary @" + shell_quote(body_file.path());
+    }
     cmd += " " + shell_quote(url) + " 2>&1";
 
     FILE *pipe = popen(cmd.c_str(), "r");
     if (!pipe) {
         response.error = std::string("curl launch failed: ") + strerror(errno);
-        if (!body_file.empty()) unlink(body_file.c_str());
         return response;
     }
     response.body = read_stream(pipe);
     int status = pclose(pipe);
-    if (!body_file.empty()) unlink(body_file.c_str());
     response.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : status;
     response.ok = (response.exit_code == 0);
     if (!response.ok) {
@@ -929,6 +1276,108 @@ static HttpResponse curl_request(const std::string &method,
                 " url=" + url + " error=" + ellipsize(trim(response.error), 140));
     }
     return response;
+}
+
+static bool write_private_seek_playlist(const std::string &playlist,
+                                        std::string &path,
+                                        std::string &error)
+{
+    char path_template[] = "/tmp/m5streamplayer-seek-XXXXXX.m3u8";
+    int fd = mkstemps(path_template, 5);
+    if (fd < 0) {
+        error = std::string("无法创建快进播放列表: ") + strerror(errno);
+        return false;
+    }
+    if (fchmod(fd, 0600) != 0) {
+        error = std::string("无法保护快进播放列表: ") + strerror(errno);
+        close(fd);
+        unlink(path_template);
+        return false;
+    }
+    if (geteuid() == 0) {
+        struct passwd *pi = getpwnam("pi");
+        if (pi && fchown(fd, pi->pw_uid, pi->pw_gid) != 0) {
+            error = std::string("无法设置快进播放列表所有者: ") + strerror(errno);
+            close(fd);
+            unlink(path_template);
+            return false;
+        }
+    }
+    fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+
+    const char *data = playlist.data();
+    std::size_t remaining = playlist.size();
+    while (remaining > 0) {
+        const ssize_t written = write(fd, data, remaining);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            error = std::string("无法写入快进播放列表: ") + strerror(errno);
+            close(fd);
+            unlink(path_template);
+            return false;
+        }
+        data += written;
+        remaining -= static_cast<std::size_t>(written);
+    }
+    if (close(fd) != 0) {
+        error = std::string("无法关闭快进播放列表: ") + strerror(errno);
+        unlink(path_template);
+        return false;
+    }
+    path = path_template;
+    return true;
+}
+
+static bool prepare_hls_seek_playlist(const std::string &remote_url,
+                                      const std::string &token,
+                                      long long requested_seconds,
+                                      std::string &local_url,
+                                      long long &actual_seconds,
+                                      std::string &error)
+{
+    /*
+     * Emby/Jellyfin keep the full VOD media list and express StartTimeTicks
+     * only as EXT-X-START.  gst-launch playbin on the target starts at segment
+     * zero anyway, so make the requested segment the first entry explicitly.
+     */
+    HttpResponse master = curl_request("GET", remote_url, token, "", 8, 35);
+    if (!master.ok) {
+        error = "快进播放列表加载失败";
+        return false;
+    }
+
+    std::string media_url = remote_url;
+    std::string media_playlist = master.body;
+    std::string variant_url;
+    if (hls_master_variant_uri(master.body, remote_url, variant_url)) {
+        HttpResponse variant = curl_request("GET", variant_url, token, "", 8, 35);
+        if (!variant.ok) {
+            error = "快进媒体列表加载失败";
+            return false;
+        }
+        media_url = variant_url;
+        media_playlist = variant.body;
+    }
+
+    HlsSeekPlaylist rewritten =
+        hls_trim_media_playlist(media_playlist, media_url, requested_seconds);
+    if (!rewritten.ok) {
+        error = "快进播放列表无法裁剪: " + rewritten.error;
+        return false;
+    }
+    std::string local_path;
+    if (!write_private_seek_playlist(rewritten.playlist, local_path, error)) {
+        return false;
+    }
+
+    actual_seconds = rewritten.actual_start_seconds;
+    local_url = "file://" + local_path;
+    app_log("HLS seek playlist ready requested=" +
+            std::to_string(requested_seconds) +
+            " actual=" + std::to_string(actual_seconds) +
+            " skipped_segments=" + std::to_string(rewritten.skipped_segments) +
+            " path=" + local_path);
+    return true;
 }
 
 static const char *server_name(ServerType type)
@@ -976,51 +1425,68 @@ enum class TextKey {
     DetailHelp,
     Output,
     Audio,
-    Subtitle
+    Subtitle,
+    ScanLan,
+    ScanningLan,
+    NoLanServers,
+    FoundLanServers,
+    SelectLanServer,
+    LanScanHelp,
+    LanServersTitle
 };
 
 static const char *ui_text(UiLanguage language, TextKey key)
 {
     const bool zh = language == UiLanguage::Chinese;
+    const bool ja = language == UiLanguage::Japanese;
     switch (key) {
-    case TextKey::Server: return zh ? "服务" : "Server";
-    case TextKey::Language: return zh ? "语言" : "Lang";
-    case TextKey::Account: return zh ? "账号" : "User";
-    case TextKey::Password: return zh ? "密码" : "Pass";
-    case TextKey::Login: return zh ? "登录" : "Login";
-    case TextKey::NeedCredentials: return zh ? "需要地址、账号和密码" : "URL, user and password required";
-    case TextKey::Authenticating: return zh ? "正在认证..." : "Authenticating...";
-    case TextKey::LoadingLibraries: return zh ? "加载媒体库..." : "Loading libraries...";
-    case TextKey::LoadingVideos: return zh ? "加载内容..." : "Loading media...";
-    case TextKey::PreloadingVideos: return zh ? "预加载内容..." : "Preloading media...";
-    case TextKey::NoLibraries: return zh ? "没有可用目录。" : "No libraries available.";
-    case TextKey::NoContent: return zh ? "没有内容" : "No content";
-    case TextKey::Error: return zh ? "错误" : "Error";
-    case TextKey::EnterEscBack: return zh ? "回车/Esc 返回" : "Enter/Esc Back";
-    case TextKey::HdmiTitle: return zh ? "HDMI 未连接" : "HDMI disconnected";
+    case TextKey::Server: return ja ? "サーバー" : (zh ? "服务" : "Server");
+    case TextKey::Language: return ja ? "言語" : (zh ? "语言" : "Language");
+    case TextKey::Account: return ja ? "ユーザー" : (zh ? "账号" : "User");
+    case TextKey::Password: return ja ? "パスワード" : (zh ? "密码" : "Pass");
+    case TextKey::Login: return ja ? "ログイン" : (zh ? "登录" : "Login");
+    case TextKey::NeedCredentials: return ja ? "URL、ユーザー、パスワードが必要です"
+                                              : (zh ? "需要地址、账号和密码" : "URL, user and password required");
+    case TextKey::Authenticating: return ja ? "認証中..." : (zh ? "正在认证..." : "Authenticating...");
+    case TextKey::LoadingLibraries: return ja ? "メディアライブラリを読み込み中..." : (zh ? "加载媒体库..." : "Loading libraries...");
+    case TextKey::LoadingVideos: return ja ? "コンテンツを読み込み中..." : (zh ? "加载内容..." : "Loading media...");
+    case TextKey::PreloadingVideos: return ja ? "コンテンツを準備中..." : (zh ? "预加载内容..." : "Preloading media...");
+    case TextKey::NoLibraries: return ja ? "利用できるライブラリがありません。" : (zh ? "没有可用目录。" : "No libraries available.");
+    case TextKey::NoContent: return ja ? "コンテンツがありません" : (zh ? "没有内容" : "No content");
+    case TextKey::Error: return ja ? "エラー" : (zh ? "错误" : "Error");
+    case TextKey::EnterEscBack: return ja ? "Enter/Esc 戻る" : (zh ? "回车/Esc 返回" : "Enter/Esc Back");
+    case TextKey::HdmiTitle: return ja ? "HDMI 未接続" : (zh ? "HDMI 未连接" : "HDMI disconnected");
     case TextKey::HdmiMessage:
-        return zh ? "未连接 HDMI 输出；视频建议接 HDMI，音乐播放不受影响。"
-                  : "HDMI output is not connected; video works best on HDMI. Music is unaffected.";
-    case TextKey::SmallScreenAlso: return zh ? "也可以临时在小屏幕播放。" : "Small-screen playback is also available.";
-    case TextKey::SmallScreenButton: return zh ? "我还是想看看" : "Play on small screen";
-    case TextKey::EnterConfirmEscBack: return zh ? "Enter 确认  Esc 返回" : "Enter Confirm  Esc Back";
-    case TextKey::SortTitle: return zh ? "视频排序" : "Sort";
-    case TextKey::SortHelp: return zh ? "上下选择  回车应用  Esc返回" : "Up/Down Select  Enter Apply  Esc Back";
-    case TextKey::SettingsTitle: return zh ? "设置" : "Settings";
-    case TextKey::SettingsService: return zh ? "服务: " : "Server: ";
-    case TextKey::Logout: return zh ? "退出登录" : "Log out";
-    case TextKey::LogoutHelp: return zh ? "回车退出登录  Esc返回" : "Enter Log out  Esc Back";
-    case TextKey::PreparingMusic: return zh ? "准备音乐..." : "Preparing music...";
-    case TextKey::PreparingPhoto: return zh ? "准备图片..." : "Preparing photo...";
-    case TextKey::PreparingSmallScreen: return zh ? "准备小屏播放..." : "Preparing small-screen playback...";
-    case TextKey::RequestTranscode: return zh ? "请求服务器 1080p30 转码..." : "Requesting 1080p30 transcode...";
-    case TextKey::NoPlayable: return zh ? "这个媒体没有可播放地址。" : "This item has no playable URL.";
-    case TextKey::NoOverview: return zh ? "服务器没有提供简介。" : "No overview from server.";
+        return ja ? "HDMI 出力が未接続です。動画は HDMI を推奨、音楽は影響を受けません。"
+                  : (zh ? "未连接 HDMI 输出；视频建议接 HDMI，音乐播放不受影响。"
+                        : "HDMI output is not connected; video works best on HDMI. Music is unaffected.");
+    case TextKey::SmallScreenAlso: return ja ? "小画面での再生も可能です。" : (zh ? "也可以临时在小屏幕播放。" : "Small-screen playback is also available.");
+    case TextKey::SmallScreenButton: return ja ? "小画面で再生" : (zh ? "我还是想看看" : "Play on small screen");
+    case TextKey::EnterConfirmEscBack: return ja ? "Enter 確定  Esc 戻る" : (zh ? "Enter 确认  Esc 返回" : "Enter Confirm  Esc Back");
+    case TextKey::SortTitle: return ja ? "並び替え" : (zh ? "视频排序" : "Sort");
+    case TextKey::SortHelp: return ja ? "上下で選択  Enterで適用  Escで戻る" : (zh ? "上下选择  回车应用  Esc返回" : "Up/Down Select  Enter Apply  Esc Back");
+    case TextKey::SettingsTitle: return ja ? "設定" : (zh ? "设置" : "Settings");
+    case TextKey::SettingsService: return ja ? "サーバー: " : (zh ? "服务: " : "Server: ");
+    case TextKey::Logout: return ja ? "ログアウト" : (zh ? "退出登录" : "Log out");
+    case TextKey::LogoutHelp: return ja ? "Enterでログアウト  Escで戻る" : (zh ? "回车退出登录  Esc返回" : "Enter Log out  Esc Back");
+    case TextKey::PreparingMusic: return ja ? "音楽を準備中..." : (zh ? "准备音乐..." : "Preparing music...");
+    case TextKey::PreparingPhoto: return ja ? "画像を準備中..." : (zh ? "准备图片..." : "Preparing photo...");
+    case TextKey::PreparingSmallScreen: return ja ? "小画面再生を準備中..." : (zh ? "准备小屏播放..." : "Preparing small-screen playback...");
+    case TextKey::RequestTranscode: return ja ? "サーバーに 1080p24 変換を要求中..." : (zh ? "请求服务器 1080p24 转码..." : "Requesting 1080p24 transcode...");
+    case TextKey::NoPlayable: return ja ? "このアイテムには再生できる URL がありません。" : (zh ? "这个媒体没有可播放地址。" : "This item has no playable URL.");
+    case TextKey::NoOverview: return ja ? "サーバーから概要がありません。" : (zh ? "服务器没有提供简介。" : "No overview from server.");
     case TextKey::DetailHelp:
-        return zh ? "上下切换  回车播放  空格返回  Esc列表" : "Up/Down Switch  Enter Play  Space Back  Esc List";
-    case TextKey::Output: return zh ? "输出" : "Output";
-    case TextKey::Audio: return zh ? "音频" : "Audio";
-    case TextKey::Subtitle: return zh ? "字幕" : "Sub";
+        return ja ? "上下で切替  Enterで再生  スペースで戻る  Escで一覧" : (zh ? "上下切换  回车播放  空格返回  Esc列表" : "Up/Down Switch  Enter Play  Space Back  Esc List");
+    case TextKey::Output: return ja ? "出力" : (zh ? "输出" : "Output");
+    case TextKey::Audio: return ja ? "音声" : (zh ? "音频" : "Audio");
+    case TextKey::Subtitle: return ja ? "字幕" : (zh ? "字幕" : "Sub");
+    case TextKey::ScanLan: return ja ? "LAN 検索" : (zh ? "扫描局域网" : "Scan LAN");
+    case TextKey::ScanningLan: return ja ? "LAN を検索中..." : (zh ? "正在扫描局域网..." : "Scanning LAN...");
+    case TextKey::NoLanServers: return ja ? "Jellyfin/Emby サーバーが見つかりません" : (zh ? "没有找到 Jellyfin/Emby 主机" : "No Jellyfin/Emby hosts found");
+    case TextKey::FoundLanServers: return ja ? "サーバーを検出しました" : (zh ? "发现局域网主机" : "Found LAN hosts");
+    case TextKey::SelectLanServer: return ja ? "接続するサーバーを選択" : (zh ? "选择要设置的服务器" : "Select a server");
+    case TextKey::LanScanHelp: return ja ? "上下で選択  Enterで設定  Escで戻る" : (zh ? "上下选择  回车设置  Esc返回" : "Up/Down Select  Enter Set  Esc Back");
+    case TextKey::LanServersTitle: return ja ? "LAN サーバー" : (zh ? "局域网服务器" : "LAN Servers");
     }
     return "";
 }
@@ -1063,6 +1529,13 @@ static bool is_series_item(const MediaItem &item)
 static bool is_episode_item(const MediaItem &item)
 {
     return item.type == "Episode";
+}
+
+static bool is_episode_like_item(const MediaItem &item)
+{
+    if (is_episode_item(item)) return true;
+    if (!item.series_id.empty() || !item.season_id.empty()) return true;
+    return item.parent_index_number > 0 && item.index_number > 0;
 }
 
 static bool is_audio_item(const MediaItem &item)
@@ -1117,7 +1590,7 @@ static void art_ratio_for_item(const MediaItem &item, int &ratio_w, int &ratio_h
 {
     ratio_w = 16;
     ratio_h = 9;
-    if (!is_episode_item(item)) return;
+    if (!is_episode_like_item(item)) return;
 
     if (item.width > 0 && item.height > 0) {
         long long scaled = static_cast<long long>(item.width) * 1000LL / item.height;
@@ -1128,7 +1601,19 @@ static void art_ratio_for_item(const MediaItem &item, int &ratio_w, int &ratio_h
         return;
     }
 
-    if (item.primary_image_aspect_ratio >= 0.65f && item.primary_image_aspect_ratio <= 2.6f) {
+    if (item.primary_image_aspect_ratio >= 1.2f && item.primary_image_aspect_ratio <= 2.6f) {
+        ratio_w = std::max(1, static_cast<int>(item.primary_image_aspect_ratio * 1000.0f));
+        ratio_h = 1000;
+    }
+}
+
+static void poster_ratio_for_item(const MediaItem &item, int &ratio_w, int &ratio_h)
+{
+    ratio_w = 2;
+    ratio_h = 3;
+    if (!is_series_item(item)) return;
+
+    if (item.primary_image_aspect_ratio >= 0.45f && item.primary_image_aspect_ratio <= 1.1f) {
         ratio_w = std::max(1, static_cast<int>(item.primary_image_aspect_ratio * 1000.0f));
         ratio_h = 1000;
     }
@@ -1136,16 +1621,15 @@ static void art_ratio_for_item(const MediaItem &item, int &ratio_w, int &ratio_h
 
 static bool item_prefers_still_art(const MediaItem &item)
 {
-    return is_episode_item(item);
+    return is_episode_like_item(item);
 }
 
 static bool item_primary_is_landscape(const MediaItem &item)
 {
     if (item.primary_image_aspect_ratio > 0.0f) return item.primary_image_aspect_ratio >= 1.2f;
-    if (item.width > 0 && item.height > 0) {
-        return static_cast<long long>(item.width) * 10LL >= static_cast<long long>(item.height) * 12LL;
-    }
-    return item_prefers_still_art(item);
+    if (item_prefers_still_art(item)) return false;
+    return item.width > 0 && item.height > 0 &&
+           static_cast<long long>(item.width) * 10LL >= static_cast<long long>(item.height) * 12LL;
 }
 
 static bool item_image_kind_is_usable(const MediaItem &item, const std::string &kind)
@@ -1163,8 +1647,7 @@ static bool looks_landscape_file(const std::string &path)
     unsigned char header[24] = {};
     in.read(reinterpret_cast<char *>(header), sizeof(header));
     if (in.gcount() < static_cast<std::streamsize>(sizeof(header))) return false;
-    const unsigned char png_sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
-    if (memcmp(header, png_sig, sizeof(png_sig)) != 0) return false;
+    if (!file_has_png_signature(path)) return false;
     int w = (static_cast<int>(header[16]) << 24) |
             (static_cast<int>(header[17]) << 16) |
             (static_cast<int>(header[18]) << 8) |
@@ -1303,7 +1786,7 @@ static bool name_looks_episode_labeled(const std::string &name)
 
 static std::string item_breadcrumb(const MediaItem &item)
 {
-    if (is_episode_item(item)) {
+    if (is_episode_like_item(item)) {
         std::string text = item.series_name.empty() ? "剧集" : item.series_name;
         if (item.parent_index_number > 0) text += " / " + season_title(item.parent_index_number);
         if (item.index_number > 0) {
@@ -1353,6 +1836,42 @@ static bool command_exists(const char *name)
     return system(cmd.c_str()) == 0;
 }
 
+static bool ffmpeg_lists(const char *section, const char *name)
+{
+    std::string cmd = "ffmpeg -hide_banner ";
+    cmd += section;
+    cmd += " 2>/dev/null | grep -q ";
+    cmd += shell_quote(name);
+    return system(cmd.c_str()) == 0;
+}
+
+static bool ffmpeg_fbdev_ready(std::string &error)
+{
+    if (!command_exists("ffmpeg")) {
+        error = "系统缺少 ffmpeg，无法使用 HDMI 硬解播放。";
+        return false;
+    }
+    if (!ffmpeg_lists("-decoders", "h264_v4l2m2m")) {
+        error = "系统 ffmpeg 缺少 h264_v4l2m2m 硬解组件。";
+        return false;
+    }
+    if (!ffmpeg_lists("-muxers", "fbdev")) {
+        error = "系统 ffmpeg 缺少 fbdev 输出组件。";
+        return false;
+    }
+    if (!ffmpeg_lists("-muxers", "alsa")) {
+        error = "系统 ffmpeg 缺少 ALSA 音频输出组件。";
+        return false;
+    }
+    return true;
+}
+
+static bool gst_element_exists(const char *name)
+{
+    std::string cmd = "gst-inspect-1.0 " + shell_quote(name) + " >/dev/null 2>&1";
+    return system(cmd.c_str()) == 0;
+}
+
 static bool path_exists(const char *path)
 {
     return path && access(path, F_OK) == 0;
@@ -1398,9 +1917,37 @@ static bool hdmi_output_connected()
     return status_count == 0;
 }
 
+static void prepare_hdmi_output_mode()
+{
+    const char *mode_env = getenv("M5_HDMI_MODE");
+    std::string mode = (mode_env && *mode_env) ? mode_env : "1920x1080@60Hz";
+    std::string lowered = to_lower(trim(mode));
+    if (lowered.empty() || lowered == "keep" || lowered == "off" ||
+        lowered == "false" || lowered == "0") {
+        app_log("HDMI mode request skipped mode=" + mode);
+        return;
+    }
+    if (!command_exists("wlr-randr") || !path_exists("/run/user/1000/wayland-0")) return;
+
+    const char *output_env = getenv("M5_HDMI_OUTPUT");
+    std::string output = (output_env && *output_env) ? output_env : "HDMI-A-1";
+    std::string inner = "XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 "
+                        "wlr-randr --output " + shell_quote(output) +
+                        " --mode " + shell_quote(mode) +
+                        " >/dev/null 2>&1";
+    std::string cmd = inner;
+    if (getuid() == 0 && command_exists("su")) {
+        cmd = "su -s /bin/sh pi -c " + shell_quote(inner);
+    }
+    int rc = system(cmd.c_str());
+    app_log("HDMI mode request output=" + output +
+            " mode=" + mode +
+            " rc=" + std::to_string(rc));
+}
+
 static const char *hdmi_required_message()
 {
-    return "未连接 HDMI 输出；视频建议接 HDMI，音乐播放不受影响。";
+    return "";
 }
 
 static std::string small_lcd_fbdev_path()
@@ -1410,13 +1957,121 @@ static std::string small_lcd_fbdev_path()
 
     std::ifstream proc("/proc/fb");
     std::string line;
+    int fallback_fb = -1;
+    int framebuffer_count = 0;
     while (std::getline(proc, line)) {
-        if (line.find("fb_st7789v") == std::string::npos) continue;
         std::istringstream iss(line);
         int fb = -1;
-        if (iss >> fb && fb >= 0) return "/dev/fb" + std::to_string(fb);
+        std::string driver;
+        if (!(iss >> fb >> driver) || fb < 0) continue;
+        if (framebuffer_count == 0) fallback_fb = fb;
+        framebuffer_count++;
+        const std::string lowered = to_lower(driver);
+        if (lowered.find("fb_st7789") != std::string::npos ||
+            lowered.find("panel-mipi-dbi") != std::string::npos ||
+            lowered.find("st7789") != std::string::npos) {
+            return "/dev/fb" + std::to_string(fb);
+        }
     }
-    return "/dev/fb0";
+    if (framebuffer_count == 1 && fallback_fb >= 0) {
+        return "/dev/fb" + std::to_string(fallback_fb);
+    }
+    return "";
+}
+
+static long long meminfo_kilobytes(const char *key)
+{
+    std::ifstream meminfo("/proc/meminfo");
+    std::string line;
+    while (std::getline(meminfo, line)) {
+        std::istringstream fields(line);
+        std::string name;
+        long long value = -1;
+        if ((fields >> name >> value) && name == key) return value;
+    }
+    return -1;
+}
+
+static bool hardware_decode_memory_ready(std::string &error)
+{
+    const long long cma_kb = meminfo_kilobytes("CmaTotal:");
+    if (cma_kb >= 0 && cma_kb < 48 * 1024) {
+        error = "硬解预留内存尚未生效，请重启设备后再播放。";
+        app_log("Hardware decode blocked insufficient CMA kB=" + std::to_string(cma_kb));
+        return false;
+    }
+    return true;
+}
+
+static bool gstreamer_small_fbdev_ready(std::string &error)
+{
+    if (!hardware_decode_memory_ready(error)) return false;
+    if (!command_exists("gst-launch-1.0")) {
+        error = "系统缺少 gst-launch-1.0，无法使用小屏硬解播放。";
+        return false;
+    }
+    if (!gst_element_exists("v4l2h264dec")) {
+        error = "系统 GStreamer 缺少 v4l2h264dec 硬解组件。";
+        return false;
+    }
+    if (!gst_element_exists("fbdevsink")) {
+        error = "系统 GStreamer 缺少 fbdevsink 小屏输出组件。";
+        return false;
+    }
+    if (!gst_element_exists("alsasink")) {
+        error = "系统 GStreamer 缺少 alsasink 音频输出组件。";
+        return false;
+    }
+    const std::string fbdev = small_lcd_fbdev_path();
+    if (fbdev.empty() || access(fbdev.c_str(), R_OK | W_OK) != 0) {
+        error = "未找到可读写的 CardputerZero 小屏 framebuffer。";
+        return false;
+    }
+    return true;
+}
+
+static std::string hdmi_drm_connector_id()
+{
+    const char *override = getenv("M5_HDMI_DRM_CONNECTOR_ID");
+    if (override && *override) return override;
+    std::string value = read_first_line_file("/sys/class/drm/card0-HDMI-A-1/connector_id");
+    return value.empty() ? "33" : value;
+}
+
+static bool gstreamer_kms_ready(std::string &error)
+{
+    if (!hardware_decode_memory_ready(error)) return false;
+    if (!command_exists("gst-launch-1.0")) {
+        error = "系统缺少 gst-launch-1.0，无法使用 HDMI KMS 硬解直出。";
+        return false;
+    }
+    if (!gst_element_exists("v4l2h264dec")) {
+        error = "系统 GStreamer 缺少 v4l2h264dec H.264 硬解组件。";
+        return false;
+    }
+    if (!gst_element_exists("kmssink")) {
+        error = "系统 GStreamer 缺少 kmssink DRM/KMS 输出组件。";
+        return false;
+    }
+    if (!gst_element_exists("alsasink")) {
+        error = "系统 GStreamer 缺少 alsasink 音频输出组件。";
+        return false;
+    }
+    if (access("/dev/dri/card0", R_OK | W_OK) != 0) {
+        error = "当前用户没有 HDMI DRM/KMS 设备访问权限。";
+        return false;
+    }
+    if (getuid() != 0) {
+        const int can_start =
+            system("/usr/bin/sudo -n -l /usr/bin/systemctl "
+                   "start streamplayer-display-guard.service "
+                   ">/dev/null 2>&1");
+        if (can_start != 0) {
+            error = "HDMI KMS 直出缺少 StreamPlayer 的显示守护权限。";
+            return false;
+        }
+    }
+    return true;
 }
 
 static const lv_font_t *builtin_font_14()
@@ -1441,6 +2096,10 @@ static lv_font_t *g_runtime_font_14 = nullptr;
 static lv_font_t *g_runtime_font_16 = nullptr;
 static lv_font_t *g_runtime_font_21 = nullptr;
 static lv_font_t *g_runtime_font_28 = nullptr;
+static lv_font_t *g_runtime_fallback_font_14 = nullptr;
+static lv_font_t *g_runtime_fallback_font_16 = nullptr;
+static lv_font_t *g_runtime_fallback_font_21 = nullptr;
+static lv_font_t *g_runtime_fallback_font_28 = nullptr;
 static bool g_runtime_fonts_initialized = false;
 
 static const lv_font_t *ui_font_14()
@@ -1475,10 +2134,22 @@ static std::vector<std::string> runtime_font_path_variants(const std::string &pa
     bool has_driver = trimmed.size() >= 2 && trimmed[0] >= 'A' && trimmed[0] <= 'Z' &&
                       trimmed[1] == ':';
     if (!has_driver) {
+        /*
+         * The POSIX LVGL driver is rooted at "/", so canonicalize relative
+         * development paths before adding its driver letter.  This also
+         * prevents an absolute path such as /usr/share/... from becoming
+         * relative to APPLaunch's working directory.
+         */
+        std::string fs_path = trimmed;
+        char *resolved = realpath(trimmed.c_str(), nullptr);
+        if (resolved) {
+            fs_path = resolved;
+            free(resolved);
+        }
         std::string prefixed;
         prefixed.push_back(static_cast<char>(LV_FS_POSIX_LETTER));
         prefixed.push_back(':');
-        prefixed += trimmed;
+        prefixed += fs_path;
         variants.push_back(prefixed);
     }
 #endif
@@ -1486,29 +2157,53 @@ static std::vector<std::string> runtime_font_path_variants(const std::string &pa
     return variants;
 }
 
-static std::vector<std::string> candidate_font_paths()
+static std::vector<std::string> candidate_font_paths(const char *primary_env,
+                                                     const char *legacy_env,
+                                                     std::initializer_list<const char *> defaults)
 {
     std::vector<std::string> paths;
-    const char *override_path = getenv("M5_STREAMPLAYER_FONT");
+    const char *override_path = primary_env ? getenv(primary_env) : nullptr;
     if (override_path && *override_path) paths.push_back(override_path);
+    if (legacy_env) {
+        const char *legacy_path = getenv(legacy_env);
+        if (legacy_path && *legacy_path) paths.push_back(legacy_path);
+    }
+    for (const char *path : defaults) paths.push_back(path);
+    return paths;
+}
 
-    const char *defaults[] = {
+static std::vector<std::string> candidate_primary_font_paths()
+{
+    /* Primary = DejaVu (full Latin glyphs, symbols like ⏪⏩, monospace spacing for UI) */
+    return candidate_font_paths("M5_STREAMPLAYER_FONT_LATIN", "M5_STREAMPLAYER_FONT", {
+        "fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    });
+}
+
+static std::vector<std::string> candidate_fallback_font_paths()
+{
+    /* Fallback = NotoSansSC (CJK glyphs for 中日英) */
+    return candidate_font_paths("M5_STREAMPLAYER_FONT_FALLBACK", "M5_STREAMPLAYER_FALLBACK_FONT", {
+        /* Prefer NotoSansCJK-Regular.ttc (face 0 = JP) for best CJK cross-language support.
+         * LVGL lv_tiny_ttf opens TTC face 0 only. The TTC covers JP, KR, SC, TC, HK.
+         * For JP users this is ideal; for SC users most characters still match.
+         * NotoSansSC-Regular.ttf is kept as later fallback for SC-specific deployments. */
+        "fonts/NotoSansCJK-Regular.ttc",
+        "NotoSansCJK-Regular.ttc",
+        "dist/NotoSansCJK-Regular.ttc",
+        "/usr/share/APPLaunch/share/font/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "fonts/NotoSansSC-Regular.ttf",
         "NotoSansSC-Regular.ttf",
         "dist/NotoSansSC-Regular.ttf",
-        "fonts/NotoSansCJK-Regular.ttc",
         "fonts/SourceHanSansSC-Regular.otf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/APPLaunch/share/font/NotoSansSC-Regular.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
         "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.ttf",
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-    };
-
-    for (size_t i = 0; i < sizeof(defaults) / sizeof(defaults[0]); ++i) {
-        paths.push_back(defaults[i]);
-    }
-    return paths;
+    });
 }
 
 static void write_font_status_file(const std::string &status, const std::string &detail)
@@ -1519,36 +2214,96 @@ static void write_font_status_file(const std::string &status, const std::string 
     fclose(file);
 }
 
+static bool load_runtime_font_family(const std::vector<std::string> &paths,
+                                     size_t cache_count,
+                                     lv_font_t *&font_14,
+                                     lv_font_t *&font_16,
+                                     lv_font_t *&font_21,
+                                     lv_font_t *&font_28,
+                                     std::string &loaded_path)
+{
+#if LV_USE_TINY_TTF && LV_TINY_TTF_FILE_SUPPORT
+    for (size_t i = 0; i < paths.size(); ++i) {
+        std::vector<std::string> variants = runtime_font_path_variants(paths[i]);
+        for (size_t j = 0; j < variants.size(); ++j) {
+            const std::string &variant = variants[j];
+            lv_font_t *candidate_14 = lv_tiny_ttf_create_file_ex(
+                variant.c_str(), 14, LV_FONT_KERNING_NORMAL, cache_count);
+            if (!candidate_14) continue;
+
+            lv_font_t *candidate_16 = lv_tiny_ttf_create_file_ex(
+                variant.c_str(), 16, LV_FONT_KERNING_NORMAL, cache_count);
+            lv_font_t *candidate_21 = lv_tiny_ttf_create_file_ex(
+                variant.c_str(), 21, LV_FONT_KERNING_NORMAL, cache_count);
+            lv_font_t *candidate_28 = lv_tiny_ttf_create_file_ex(
+                variant.c_str(), 28, LV_FONT_KERNING_NORMAL, cache_count);
+            if (!candidate_16 || !candidate_21 || !candidate_28) {
+                lv_tiny_ttf_destroy(candidate_14);
+                if (candidate_16) lv_tiny_ttf_destroy(candidate_16);
+                if (candidate_21) lv_tiny_ttf_destroy(candidate_21);
+                if (candidate_28) lv_tiny_ttf_destroy(candidate_28);
+                continue;
+            }
+
+            font_14 = candidate_14;
+            font_16 = candidate_16;
+            font_21 = candidate_21;
+            font_28 = candidate_28;
+            loaded_path = variant;
+            return true;
+        }
+    }
+#else
+    (void)paths;
+    (void)cache_count;
+    (void)font_14;
+    (void)font_16;
+    (void)font_21;
+    (void)font_28;
+    (void)loaded_path;
+#endif
+    return false;
+}
+
 static void init_runtime_fonts()
 {
     if (g_runtime_fonts_initialized) return;
     g_runtime_fonts_initialized = true;
 
 #if LV_USE_TINY_TTF && LV_TINY_TTF_FILE_SUPPORT
-    std::vector<std::string> paths = candidate_font_paths();
-    for (size_t i = 0; i < paths.size(); ++i) {
-        std::vector<std::string> variants = runtime_font_path_variants(paths[i]);
-        for (size_t j = 0; j < variants.size(); ++j) {
-            const std::string &variant = variants[j];
-            lv_font_t *font_16 = lv_tiny_ttf_create_file(variant.c_str(), 16);
-            if (!font_16) continue;
-
-            lv_font_t *font_14 = lv_tiny_ttf_create_file(variant.c_str(), 14);
-            if (!font_14) {
-                lv_tiny_ttf_destroy(font_16);
-                continue;
-            }
-            lv_font_t *font_21 = lv_tiny_ttf_create_file(variant.c_str(), 21);
-            lv_font_t *font_28 = lv_tiny_ttf_create_file(variant.c_str(), 28);
-
-            g_runtime_font_16 = font_16;
-            g_runtime_font_14 = font_14;
-            g_runtime_font_21 = font_21 ? font_21 : font_16;
-            g_runtime_font_28 = font_28 ? font_28 : (font_21 ? font_21 : font_16);
-            fprintf(stderr, "StreamPlayer font loaded: %s\n", variant.c_str());
-            write_font_status_file("loaded", variant);
-            return;
+    std::string primary_path;
+    if (load_runtime_font_family(candidate_primary_font_paths(),
+                                 LV_TINY_TTF_CACHE_GLYPH_CNT,
+                                 g_runtime_font_14,
+                                 g_runtime_font_16,
+                                 g_runtime_font_21,
+                                 g_runtime_font_28,
+                                 primary_path)) {
+        std::string fallback_path;
+        bool fallback_loaded = load_runtime_font_family(
+            candidate_fallback_font_paths(),
+            LV_TINY_TTF_CACHE_GLYPH_CNT,
+            g_runtime_fallback_font_14,
+            g_runtime_fallback_font_16,
+            g_runtime_fallback_font_21,
+            g_runtime_fallback_font_28,
+            fallback_path);
+        if (fallback_loaded) {
+            g_runtime_font_14->fallback = g_runtime_fallback_font_14;
+            g_runtime_font_16->fallback = g_runtime_fallback_font_16;
+            g_runtime_font_21->fallback = g_runtime_fallback_font_21;
+            g_runtime_font_28->fallback = g_runtime_fallback_font_28;
         }
+
+        fprintf(stderr,
+                "StreamPlayer font loaded: primary=%s fallback=%s\n",
+                primary_path.c_str(),
+                fallback_loaded ? fallback_path.c_str() : "none");
+        write_font_status_file(
+            "loaded",
+            "primary=" + primary_path +
+                "\nfallback=" + (fallback_loaded ? fallback_path : "none"));
+        return;
     }
 #endif
 
@@ -1715,10 +2470,12 @@ public:
         }
         path += "StartIndex=" + std::to_string(start_index) + "&Limit=" + std::to_string(limit) + "&";
         path += library_is_recent_played(library) ? recent_played_query() : sort_query(sort);
-        path += "&Fields=Overview,DateCreated,PremiereDate,RunTimeTicks,MediaSources,MediaStreams,ParentId,SeriesName,SeriesId,SeasonId,Path,Genres,ProductionYear,ImageTags,BackdropImageTags,PrimaryImageAspectRatio,CommunityRating,CriticRating,Album,AlbumArtist,ParentThumbImageTag,ParentBackdropImageTags";
+        path += "&Fields=Overview,DateCreated,PremiereDate,RunTimeTicks,MediaSources,MediaStreams,ParentId,SeriesName,SeriesId,SeasonId,Path,Genres,ProductionYear,ImageTags,BackdropImageTags,PrimaryImageAspectRatio,CommunityRating,CriticRating,Album,AlbumArtist,ParentThumbImageTag,ParentBackdropImageTags,ParentThumbItemId,ParentBackdropItemId";
         HttpResponse res = curl_request("GET", join_url(cfg_.base_url, path), cfg_.access_token);
         if (!res.ok) {
-            error = "媒体加载失败: " + ellipsize(trim(res.error), 80);
+            error = (language_from_code(cfg_.language.empty() ? system_language_code() : cfg_.language) == UiLanguage::Japanese ? "メディア読み込み失敗: "
+                     : (language_from_code(cfg_.language.empty() ? system_language_code() : cfg_.language) == UiLanguage::Chinese ? "媒体加载失败: "
+                        : "Media load failed: ")) + ellipsize(trim(res.error), 80);
             return false;
         }
         items.clear();
@@ -1742,10 +2499,12 @@ public:
         path += "IncludeItemTypes=Movie,Episode,Video,Audio,Photo&";
         path += "StartIndex=" + std::to_string(start_index) + "&Limit=" + std::to_string(limit) + "&";
         path += sort_query(sort);
-        path += "&Fields=Overview,DateCreated,PremiereDate,RunTimeTicks,MediaSources,MediaStreams,ParentId,SeriesName,SeriesId,SeasonId,Path,Genres,ProductionYear,ImageTags,BackdropImageTags,PrimaryImageAspectRatio,CommunityRating,CriticRating,Album,AlbumArtist,ParentThumbImageTag,ParentBackdropImageTags";
+        path += "&Fields=Overview,DateCreated,PremiereDate,RunTimeTicks,MediaSources,MediaStreams,ParentId,SeriesName,SeriesId,SeasonId,Path,Genres,ProductionYear,ImageTags,BackdropImageTags,PrimaryImageAspectRatio,CommunityRating,CriticRating,Album,AlbumArtist,ParentThumbImageTag,ParentBackdropImageTags,ParentThumbItemId,ParentBackdropItemId";
         HttpResponse res = curl_request("GET", join_url(cfg_.base_url, path), cfg_.access_token);
         if (!res.ok) {
-            error = "搜索失败: " + ellipsize(trim(res.error), 80);
+            error = (language_from_code(cfg_.language.empty() ? system_language_code() : cfg_.language) == UiLanguage::Japanese ? "検索失敗: "
+                     : (language_from_code(cfg_.language.empty() ? system_language_code() : cfg_.language) == UiLanguage::Chinese ? "搜索失败: "
+                        : "Search failed: ")) + ellipsize(trim(res.error), 80);
             return false;
         }
         items.clear();
@@ -1763,8 +2522,11 @@ public:
 
     std::string image_url(const MediaItem &item, const std::string &kind, int width, int height) const
     {
-        if (item.id.empty() || cfg_.base_url.empty()) return "";
-        std::string path = "/Items/" + url_encode(item.id) + "/Images/" + kind;
+        std::string image_id = item.id;
+        if (kind == "Thumb" && !item.thumb_item_id.empty()) image_id = item.thumb_item_id;
+        if (kind == "Backdrop" && !item.backdrop_item_id.empty()) image_id = item.backdrop_item_id;
+        if (image_id.empty() || cfg_.base_url.empty()) return "";
+        std::string path = "/Items/" + url_encode(image_id) + "/Images/" + kind;
         if (kind == "Backdrop") path += "/0";
         std::string url = join_url(cfg_.base_url, path);
         url = append_query(url, "width", std::to_string(width));
@@ -1779,8 +2541,11 @@ public:
 
     std::string image_fit_url(const MediaItem &item, const std::string &kind, int max_width, int max_height) const
     {
-        if (item.id.empty() || cfg_.base_url.empty()) return "";
-        std::string path = "/Items/" + url_encode(item.id) + "/Images/" + kind;
+        std::string image_id = item.id;
+        if (kind == "Thumb" && !item.thumb_item_id.empty()) image_id = item.thumb_item_id;
+        if (kind == "Backdrop" && !item.backdrop_item_id.empty()) image_id = item.backdrop_item_id;
+        if (image_id.empty() || cfg_.base_url.empty()) return "";
+        std::string path = "/Items/" + url_encode(image_id) + "/Images/" + kind;
         if (kind == "Backdrop") path += "/0";
         std::string url = join_url(cfg_.base_url, path);
         url = append_query(url, "maxWidth", std::to_string(max_width));
@@ -1818,7 +2583,7 @@ public:
     {
         std::string path = "/Shows/" + url_encode(series.id) + "/Seasons?";
         path += "UserId=" + url_encode(cfg_.user_id);
-        path += "&Fields=Overview,DateCreated,PremiereDate,RunTimeTicks,ImageTags,BackdropImageTags,CommunityRating,CriticRating,ParentThumbImageTag,ParentBackdropImageTags";
+        path += "&Fields=Overview,DateCreated,PremiereDate,RunTimeTicks,ImageTags,BackdropImageTags,PrimaryImageAspectRatio,CommunityRating,CriticRating,ParentThumbImageTag,ParentBackdropImageTags,ParentThumbItemId,ParentBackdropItemId";
         path += "&SortBy=SortName&SortOrder=Ascending";
         HttpResponse res = curl_request("GET", join_url(cfg_.base_url, path), cfg_.access_token);
         if (!res.ok) {
@@ -1848,7 +2613,7 @@ public:
         std::string path = "/Shows/" + url_encode(series_id) + "/Episodes?";
         path += "UserId=" + url_encode(cfg_.user_id);
         if (!season_id.empty()) path += "&SeasonId=" + url_encode(season_id);
-        path += "&Fields=Overview,DateCreated,PremiereDate,RunTimeTicks,MediaSources,MediaStreams,SeriesName,SeriesId,SeasonId,Path,Genres,ProductionYear,ImageTags,BackdropImageTags,CommunityRating,CriticRating,ParentThumbImageTag,ParentBackdropImageTags";
+        path += "&Fields=Overview,DateCreated,PremiereDate,RunTimeTicks,MediaSources,MediaStreams,SeriesName,SeriesId,SeasonId,Path,Genres,ProductionYear,ImageTags,BackdropImageTags,PrimaryImageAspectRatio,CommunityRating,CriticRating,ParentThumbImageTag,ParentBackdropImageTags,ParentThumbItemId,ParentBackdropItemId";
         path += "&SortBy=ParentIndexNumber,IndexNumber&SortOrder=Ascending";
         HttpResponse res = curl_request("GET", join_url(cfg_.base_url, path), cfg_.access_token);
         if (!res.ok) {
@@ -1870,7 +2635,7 @@ public:
         const int target_height = small_screen ? kSmallScreenTranscodeMaxHeight : kTranscodeMaxHeight;
         const int target_video_bitrate = small_screen ? kSmallScreenTranscodeVideoBitrate : kTranscodeVideoBitrate;
         const int target_max_bitrate = small_screen ? kSmallScreenTranscodeMaxBitrate : kTranscodeMaxBitrate;
-        const std::string target_label = small_screen ? "320x170" : "1080p30";
+        const std::string target_label = small_screen ? "320x170" : "1080p24";
         app_log("PlaybackInfo request item=" + item.id + " name=" + item.name +
                 " codec=" + item.video_codec + "/" + item.audio_codec +
                 " size=" + std::to_string(item.width) + "x" + std::to_string(item.height) +
@@ -1931,6 +2696,7 @@ public:
                 " sources=" + std::to_string(sources.size()));
         std::string best_transcode;
         std::string best_source_id;
+        std::vector<MediaStream> best_source_streams;
         bool server_can_transcode = false;
         int best_source_score = 0x7fffffff;
         for (const auto &source : sources) {
@@ -1970,13 +2736,13 @@ public:
                         ? fallback_hls_url(item.id, source_id, target_video_bitrate, target_width, target_height)
                         : transcode;
                     best_source_id = source_id;
+                    best_source_streams = parse_streams(source);
                     best_source_score = score;
                 }
             } else {
                 app_log("PlaybackInfo source item=" + item.id + " source=" + source_id +
                         " supports_transcode=0 has_url=" + bool_text(!transcode.empty()));
             }
-            if (choice.streams.empty()) choice.streams = parse_streams(source);
         }
 
         if (sources.empty()) {
@@ -1997,6 +2763,8 @@ public:
         choice.transcoding = true;
         choice.summary = target_label + " H.264/AAC transcode";
         choice.media_source_id = best_source_id;
+        choice.streams = best_source_streams;
+        if (choice.streams.empty()) choice.streams = item.streams;
         app_log("PlaybackInfo selected item=" + item.id +
                 " source=" + best_source_id +
                 " score=" + std::to_string(best_source_score) +
@@ -2035,7 +2803,7 @@ public:
         }
         std::string path = "/Shows/" + url_encode(current.series_id) + "/Episodes?";
         path += "UserId=" + url_encode(cfg_.user_id);
-        path += "&Fields=Overview,DateCreated,PremiereDate,RunTimeTicks,MediaStreams,SeriesName,SeriesId,SeasonId,ImageTags,BackdropImageTags,ParentThumbImageTag,ParentBackdropImageTags";
+        path += "&Fields=Overview,DateCreated,PremiereDate,RunTimeTicks,MediaStreams,SeriesName,SeriesId,SeasonId,ImageTags,BackdropImageTags,PrimaryImageAspectRatio,ParentThumbImageTag,ParentBackdropImageTags,ParentThumbItemId,ParentBackdropItemId";
         path += "&SortBy=ParentIndexNumber,IndexNumber&SortOrder=Ascending";
         HttpResponse res = curl_request("GET", join_url(cfg_.base_url, path), cfg_.access_token);
         if (!res.ok) {
@@ -2157,7 +2925,8 @@ private:
             body += ",\"MediaSourceId\":\"" + json_escape(choice.media_source_id) + "\"";
         }
         body += "}";
-        HttpResponse res = curl_request("POST", join_url(cfg_.base_url, endpoint), cfg_.access_token, body);
+        HttpResponse res = curl_request("POST", join_url(cfg_.base_url, endpoint),
+                                        cfg_.access_token, body, 3, 6);
         app_log(std::string("Playback report ") + endpoint + " item=" + item.id +
                 " session=" + choice.play_session_id +
                 " position_ticks=" + std::to_string(position_ticks) +
@@ -2174,14 +2943,25 @@ class HdmiPlayer {
 public:
     ~HdmiPlayer() { stop(); }
 
+    bool preserve_kms_for_restart(bool small_screen_output)
+    {
+        preserve_kms_on_next_stop_ =
+            kms_exclusive_ && video_target_uses_kms(small_screen_output);
+        return preserve_kms_on_next_stop_;
+    }
+
     bool start(const std::string &url, const std::string &token, std::string &error,
                bool keep_open = false, bool video_mode = true,
                AudioOutput audio_output = AudioOutput::Speaker,
                long long start_seconds = 0,
                bool small_screen_output = false)
     {
+        std::string next_temporary_playlist =
+            temporary_seek_playlist_from_url(url);
         audio_output_ = audio_output;
         last_start_offset_supported_ = start_seconds <= 0;
+        const bool target_uses_kms =
+            video_mode && video_target_uses_kms(small_screen_output);
         app_log("HdmiPlayer start request keep_open=" + bool_text(keep_open) +
                 " video_mode=" + bool_text(video_mode) +
                 " audio_output=" + audio_output_label(audio_output_) +
@@ -2191,13 +2971,22 @@ public:
                 " custom=" + bool_text(getenv("M5_HDMI_PLAYER") && getenv("M5_HDMI_PLAYER")[0]) +
                 " url=" + url);
         stop();
+        temporary_seek_playlist_ = next_temporary_playlist;
+        if (!target_uses_kms && kms_exclusive_) {
+            release_kms_exclusive();
+            if (kms_exclusive_) {
+                error = "恢复桌面显示失败，已阻止非 KMS 播放。";
+                app_log("HdmiPlayer start blocked display guard release failed");
+                return false;
+            }
+        }
+        reset_player_log_file();
         apply_pipewire_default_output(audio_output_);
         if (small_screen_output) {
-            if (command_exists("ffmpeg")) {
-                return launch_ffmpeg_small_fbdev(url, token, error, start_seconds, video_mode);
+            if (gstreamer_small_fbdev_ready(error)) {
+                return launch_gstreamer_small_fbdev(url, error, start_seconds, video_mode);
             }
-            error = "小屏播放需要 ffmpeg。";
-            app_log("HdmiPlayer small-screen failed no ffmpeg");
+            app_log("HdmiPlayer small-screen failed gstreamer unavailable error=" + error);
             return false;
         }
         const char *override_cmd = getenv("M5_HDMI_PLAYER");
@@ -2229,6 +3018,20 @@ public:
         if (backend && strcmp(backend, "ffplay") == 0 && command_exists("ffplay")) {
             return launch_simple("ffplay", url, error, keep_open, video_mode, start_seconds);
         }
+        if (backend && (strcmp(backend, "kms") == 0 || strcmp(backend, "gstreamer-kms") == 0) &&
+            video_mode && command_exists("gst-launch-1.0")) {
+            return launch_gstreamer_kms(url, error, start_seconds);
+        }
+        if (backend && (strcmp(backend, "wayland") == 0 || strcmp(backend, "gstreamer-wayland") == 0) &&
+            video_mode && command_exists("gst-launch-1.0")) {
+            return launch_gstreamer_wayland(url, error, start_seconds);
+        }
+        if (backend && strcmp(backend, "gstreamer") == 0 && video_mode && command_exists("gst-launch-1.0")) {
+            return launch_gstreamer_kms(url, error, start_seconds);
+        }
+        if (backend && strcmp(backend, "cvlc") == 0 && command_exists("cvlc")) {
+            return launch_simple("cvlc", url, error, keep_open, video_mode, start_seconds);
+        }
         if (backend && strcmp(backend, "vlc") == 0 && command_exists("vlc")) {
             return launch_simple("vlc", url, error, keep_open, video_mode, start_seconds);
         }
@@ -2236,24 +3039,37 @@ public:
             return launch_mpv(url, token, error, keep_open, start_seconds);
         }
 
+        if (video_mode && command_exists("gst-launch-1.0")) {
+            return launch_gstreamer_kms(url, error, start_seconds);
+        }
         if (desktop_session_available() && launch_desktop_player(url, token, error, keep_open, video_mode, start_seconds)) return true;
         if (command_exists("mpv")) return launch_mpv(url, token, error, keep_open, start_seconds);
         if (!video_mode && command_exists("ffplay")) return launch_simple("ffplay", url, error, keep_open, video_mode, start_seconds);
-        if (command_exists("ffmpeg")) return launch_ffmpeg_fbdev(url, token, error, start_seconds);
+        if (video_mode && command_exists("cvlc")) return launch_simple("cvlc", url, error, keep_open, video_mode, start_seconds);
+        if (video_mode && command_exists("vlc")) return launch_simple("vlc", url, error, keep_open, video_mode, start_seconds);
         if (command_exists("ffplay")) return launch_simple("ffplay", url, error, keep_open, video_mode, start_seconds);
-        if (command_exists("vlc")) return launch_simple("vlc", url, error, keep_open, video_mode, start_seconds);
-        error = "Install mpv, ffmpeg, ffplay, vlc, or set M5_HDMI_PLAYER.";
+        if (video_mode && command_exists("ffmpeg")) return launch_ffmpeg_fbdev(url, token, error, start_seconds);
+        error = "Install gst-launch-1.0, mpv, ffmpeg, ffplay, cvlc, vlc, or set M5_HDMI_PLAYER.";
         app_log("HdmiPlayer start failed no backend url=" + url);
         return false;
     }
 
     void stop()
     {
+        const bool preserve_kms =
+            preserve_kms_on_next_stop_ && kms_exclusive_;
+        preserve_kms_on_next_stop_ = false;
         if (pid_ > 0) {
+            const bool graceful_gst_stop = is_gstreamer_backend();
+            const int stop_signal = graceful_gst_stop ? SIGINT : SIGTERM;
+            const int wait_attempts = graceful_gst_stop ? 200 : 20;
             app_log("HdmiPlayer stop pid=" + std::to_string(static_cast<long long>(pid_)) +
-                    " backend=" + backend_);
-            kill(pid_, SIGTERM);
-            for (int i = 0; i < 20; ++i) {
+                    " backend=" + backend_ +
+                    " signal=" + (graceful_gst_stop ? "SIGINT" : "SIGTERM"));
+            if (kill(-pid_, stop_signal) != 0 && errno == ESRCH) {
+                kill(pid_, stop_signal);
+            }
+            for (int i = 0; i < wait_attempts; ++i) {
                 if (waitpid(pid_, nullptr, WNOHANG) == pid_) {
                     app_log("HdmiPlayer stopped pid=" + std::to_string(static_cast<long long>(pid_)));
                     pid_ = -1;
@@ -2262,14 +3078,31 @@ public:
                 usleep(10000);
             }
             if (pid_ > 0) {
-                kill(pid_, SIGKILL);
+                if (kill(-pid_, SIGKILL) != 0 && errno == ESRCH) {
+                    kill(pid_, SIGKILL);
+                }
                 waitpid(pid_, nullptr, WNOHANG);
                 app_log("HdmiPlayer killed pid=" + std::to_string(static_cast<long long>(pid_)));
             }
             pid_ = -1;
         }
+        if (preserve_kms) {
+            app_log("HDMI KMS exclusive lease preserved across player restart");
+        } else {
+            release_kms_exclusive();
+        }
         paused_ = false;
+        ready_ = false;
+        buffering_ = false;
+        playing_seen_ = false;
+        hardware_decoder_active_ = false;
+        hardware_decoder_device_.clear();
+        started_monotonic_ms_ = 0;
+        gstreamer_log_offset_ = 0;
+        gstreamer_log_tail_.clear();
+        last_gstreamer_refresh_ms_ = 0;
         unlink(kMpvSocket);
+        cleanup_temporary_seek_playlist();
     }
 
     bool pause()
@@ -2299,10 +3132,229 @@ public:
 
     const std::string &backend() const { return backend_; }
     bool paused() const { return paused_; }
-    bool running() const { return pid_ > 0; }
+    bool running()
+    {
+        if (pid_ <= 0) return false;
+        int status = 0;
+        pid_t rc = waitpid(pid_, &status, WNOHANG);
+        if (rc == 0) return true;
+        if (rc == pid_) {
+            app_log("HdmiPlayer exited pid=" + std::to_string(static_cast<long long>(pid_)) +
+                    " backend=" + backend_ + " status=" + wait_status_text(status));
+            pid_ = -1;
+            paused_ = false;
+            release_kms_exclusive();
+            cleanup_temporary_seek_playlist();
+            return false;
+        }
+        if (errno == ECHILD) {
+            app_log("HdmiPlayer child missing pid=" + std::to_string(static_cast<long long>(pid_)) +
+                    " backend=" + backend_);
+            pid_ = -1;
+            paused_ = false;
+            release_kms_exclusive();
+            cleanup_temporary_seek_playlist();
+            return false;
+        }
+        return true;
+    }
+    bool ready()
+    {
+        if (!running()) return false;
+        if (!is_gstreamer_backend()) return true;
+        refresh_gstreamer_runtime_status();
+        if (ready_ && !hardware_decoder_active_) detect_hardware_decoder();
+        return ready_ && hardware_decoder_active_;
+    }
+    bool buffering()
+    {
+        if (!is_gstreamer_backend() || !running()) return false;
+        refresh_gstreamer_runtime_status();
+        return buffering_;
+    }
+    bool hardware_decoder_failed()
+    {
+        if (!is_gstreamer_backend() || !running()) return false;
+        refresh_gstreamer_runtime_status();
+        if (!ready_) return false;
+        if (detect_hardware_decoder()) return false;
+
+        std::ifstream in(kPlayerLog);
+        std::stringstream buffer;
+        if (in) buffer << in.rdbuf();
+        const std::string log = buffer.str();
+        const bool software_decoder_seen =
+            log.find("avdec_h264") != std::string::npos ||
+            log.find("openh264dec") != std::string::npos;
+        return software_decoder_seen ||
+               (started_monotonic_ms_ > 0 &&
+                monotonic_ms() - started_monotonic_ms_ >= 8000);
+    }
     bool start_offset_supported() const { return last_start_offset_supported_; }
+    uint64_t startup_elapsed_ms() const
+    {
+        if (started_monotonic_ms_ == 0) return 0;
+        const uint64_t now = monotonic_ms();
+        return now > started_monotonic_ms_ ? now - started_monotonic_ms_ : 0;
+    }
+    void reset_startup_timeout_clock()
+    {
+        if (is_gstreamer_backend() && pid_ > 0) {
+            started_monotonic_ms_ = monotonic_ms();
+        }
+    }
 
 private:
+    static void reset_player_log_file()
+    {
+        int log_fd = open(kPlayerLog,
+                          O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+                          0600);
+        if (log_fd < 0) {
+            app_log(std::string("Player log reset failed error=") + strerror(errno));
+            return;
+        }
+        fchmod(log_fd, 0600);
+        close(log_fd);
+    }
+
+    bool is_gstreamer_backend() const
+    {
+        return backend_ == "gstreamer" ||
+               backend_ == "gstreamer-kms" ||
+               backend_ == "small-gstreamer";
+    }
+
+    bool video_target_uses_kms(bool small_screen_output) const
+    {
+        if (small_screen_output) return true;
+        if (getenv("M5_HDMI_PLAYER") && getenv("M5_HDMI_PLAYER")[0]) return false;
+
+        const char *backend = getenv("M5_HDMI_BACKEND");
+        if (backend) {
+            if (strcmp(backend, "kms") == 0 ||
+                strcmp(backend, "gstreamer-kms") == 0 ||
+                strcmp(backend, "gstreamer") == 0) {
+                return true;
+            }
+            if (strcmp(backend, "desktop") == 0 ||
+                strcmp(backend, "wayland") == 0 ||
+                strcmp(backend, "gstreamer-wayland") == 0 ||
+                strcmp(backend, "ffmpeg-fbdev") == 0 ||
+                strcmp(backend, "ffplay") == 0 ||
+                strcmp(backend, "mpv") == 0 ||
+                strcmp(backend, "cvlc") == 0 ||
+                strcmp(backend, "vlc") == 0) {
+                return false;
+            }
+        }
+        return command_exists("gst-launch-1.0");
+    }
+
+    bool detect_hardware_decoder()
+    {
+        if (hardware_decoder_active_) return true;
+        if (pid_ <= 0) return false;
+
+        const std::string fd_dir_path =
+            "/proc/" + std::to_string(static_cast<long long>(pid_)) + "/fd";
+        DIR *fd_dir = opendir(fd_dir_path.c_str());
+        if (!fd_dir) return false;
+
+        struct dirent *entry = nullptr;
+        while ((entry = readdir(fd_dir)) != nullptr) {
+            if (entry->d_name[0] == '.') continue;
+            const std::string fd_path = fd_dir_path + "/" + entry->d_name;
+            char target[512] = {0};
+            const ssize_t length = readlink(fd_path.c_str(), target, sizeof(target) - 1);
+            if (length <= 0) continue;
+            target[length] = '\0';
+            const std::string device(target);
+            if (device.find("/dev/video") != 0) continue;
+
+            const size_t slash = device.find_last_of('/');
+            const std::string node = slash == std::string::npos
+                ? device
+                : device.substr(slash + 1);
+            const std::string name = read_first_line_file(
+                "/sys/class/video4linux/" + node + "/name");
+            const std::string lowered = to_lower(name);
+            if (lowered.find("decode") == std::string::npos &&
+                lowered.find("decoder") == std::string::npos) {
+                continue;
+            }
+
+            hardware_decoder_active_ = true;
+            hardware_decoder_device_ = device;
+            app_log("Hardware decoder active pid=" +
+                    std::to_string(static_cast<long long>(pid_)) +
+                    " device=" + device +
+                    " name=" + name);
+            break;
+        }
+        closedir(fd_dir);
+        return hardware_decoder_active_;
+    }
+
+    void refresh_gstreamer_runtime_status()
+    {
+        const uint64_t now = monotonic_ms();
+        if (last_gstreamer_refresh_ms_ > 0 &&
+            now - last_gstreamer_refresh_ms_ < 250) {
+            return;
+        }
+        last_gstreamer_refresh_ms_ = now;
+
+        std::ifstream in(kPlayerLog, std::ios::binary);
+        if (!in) return;
+        in.seekg(0, std::ios::end);
+        const std::streamoff log_size = in.tellg();
+        if (log_size < 0) return;
+        if (log_size < gstreamer_log_offset_) {
+            gstreamer_log_offset_ = 0;
+            gstreamer_log_tail_.clear();
+            ready_ = false;
+            buffering_ = false;
+            playing_seen_ = false;
+        }
+        if (log_size == gstreamer_log_offset_) return;
+
+        constexpr std::streamoff kMaxStatusChunk = 256 * 1024;
+        const std::streamoff remaining = log_size - gstreamer_log_offset_;
+        const std::streamoff read_size = std::min(remaining, kMaxStatusChunk);
+        in.seekg(gstreamer_log_offset_, std::ios::beg);
+        std::string chunk(static_cast<size_t>(read_size), '\0');
+        in.read(&chunk[0], read_size);
+        chunk.resize(static_cast<size_t>(in.gcount()));
+        gstreamer_log_offset_ += static_cast<std::streamoff>(chunk.size());
+        if (chunk.empty()) return;
+
+        const std::string log = gstreamer_log_tail_ + chunk;
+        constexpr size_t kStatusTailBytes = 512;
+        gstreamer_log_tail_ =
+            log.size() > kStatusTailBytes
+                ? log.substr(log.size() - kStatusTailBytes)
+                : log;
+
+        int last_buffer_percent = -1;
+        const std::string marker = "buffer-percent=(int)";
+        size_t pos = 0;
+        while ((pos = log.find(marker, pos)) != std::string::npos) {
+            const char *value = log.c_str() + pos + marker.size();
+            last_buffer_percent = std::atoi(value);
+            pos += marker.size();
+        }
+        if (last_buffer_percent >= 0) {
+            buffering_ = last_buffer_percent < 100;
+        }
+
+        const bool pipeline_playing =
+            log.find("new-state=(GstState)playing") != std::string::npos ||
+            log.find("New clock:") != std::string::npos;
+        if (pipeline_playing) playing_seen_ = true;
+        ready_ = playing_seen_ && !buffering_;
+    }
+
     static std::string seconds_arg(long long seconds)
     {
         return std::to_string(std::max<long long>(0, seconds));
@@ -2319,6 +3371,14 @@ private:
         execvp(args.front().c_str(), argv.data());
     }
 
+    static std::string wait_status_text(int status)
+    {
+        if (WIFEXITED(status)) return "exit=" + std::to_string(WEXITSTATUS(status));
+        if (WIFSIGNALED(status)) return "signal=" + std::to_string(WTERMSIG(status));
+        if (WIFSTOPPED(status)) return "stopped=" + std::to_string(WSTOPSIG(status));
+        return "status=" + std::to_string(status);
+    }
+
     static void setup_audio_output_environment(AudioOutput output)
     {
         if (!getenv("XDG_RUNTIME_DIR") && access("/run/user/1000", F_OK) == 0) {
@@ -2327,6 +3387,27 @@ private:
         std::string sink = audio_output_pulse_sink(output);
         if (!sink.empty()) setenv("PULSE_SINK", sink.c_str(), 1);
         else unsetenv("PULSE_SINK");
+    }
+
+    static void drop_to_desktop_user()
+    {
+        if (getuid() != 0) return;
+
+        struct passwd *pw = getpwnam("pi");
+        if (!pw) return;
+
+        setenv("HOME", pw->pw_dir, 1);
+        setenv("USER", pw->pw_name, 1);
+        setenv("LOGNAME", pw->pw_name, 1);
+        if (access("/run/user/1000", F_OK) == 0) {
+            setenv("XDG_RUNTIME_DIR", "/run/user/1000", 1);
+        }
+
+        if (initgroups(pw->pw_name, pw->pw_gid) != 0 ||
+            setgid(pw->pw_gid) != 0 ||
+            setuid(pw->pw_uid) != 0) {
+            fprintf(stderr, "StreamPlayer: failed to drop desktop player to pi: %s\n", strerror(errno));
+        }
     }
 
     static std::string runtime_dir()
@@ -2381,6 +3462,8 @@ private:
 
     static void prepare_child_process()
     {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (getppid() == 1) _exit(125);
         setsid();
 
         int devnull = open("/dev/null", O_RDONLY);
@@ -2389,8 +3472,11 @@ private:
             if (devnull > STDERR_FILENO) close(devnull);
         }
 
-        int log = open("/tmp/m5streamplayer-player.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int log = open(kPlayerLog,
+                       O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+                       0600);
         if (log >= 0) {
+            fchmod(log, 0600);
             dup2(log, STDOUT_FILENO);
             dup2(log, STDERR_FILENO);
             if (log > STDERR_FILENO) close(log);
@@ -2401,15 +3487,104 @@ private:
         for (int fd = STDERR_FILENO + 1; fd < max_fd; ++fd) close(fd);
     }
 
+    bool acquire_kms_exclusive(std::string &error)
+    {
+        if (kms_exclusive_) {
+            const bool guard_active =
+                system("/usr/bin/systemctl is-active --quiet "
+                       "streamplayer-display-guard.service >/dev/null 2>&1") == 0;
+            const bool lightdm_inactive =
+                system("/usr/bin/systemctl is-active --quiet lightdm.service "
+                       ">/dev/null 2>&1") != 0;
+            const bool guard_ready =
+                access("/run/streamplayer-resource-guard/display/ready", F_OK) == 0;
+            if (guard_active && guard_ready && lightdm_inactive) return true;
+            app_log("HDMI KMS exclusive cached state drift guard_active=" +
+                    bool_text(guard_active) +
+                    " guard_ready=" + bool_text(guard_ready) +
+                    " lightdm_inactive=" + bool_text(lightdm_inactive));
+            kms_exclusive_ = false;
+            preserve_kms_on_next_stop_ = false;
+        }
+        const char *systemctl = getuid() == 0
+            ? "/usr/bin/systemctl"
+            : "/usr/bin/sudo -n /usr/bin/systemctl";
+        const bool lightdm_was_active =
+            system("/usr/bin/systemctl is-active --quiet lightdm.service "
+                   ">/dev/null 2>&1") == 0;
+        app_log("HDMI KMS exclusive acquire lightdm_active=" +
+                bool_text(lightdm_was_active));
+        std::string start_guard =
+            std::string(systemctl) +
+            " start streamplayer-display-guard.service >/dev/null 2>&1";
+        int rc = system(start_guard.c_str());
+        if (rc != 0) {
+            error = "停止 lightdm 失败，无法独占 HDMI KMS 输出。";
+            app_log("HDMI KMS exclusive display guard start failed rc=" +
+                    std::to_string(rc));
+            return false;
+        }
+        kms_exclusive_ = true;
+        for (int i = 0; i < 80; ++i) {
+            const bool guard_active =
+                system("/usr/bin/systemctl is-active --quiet "
+                       "streamplayer-display-guard.service >/dev/null 2>&1") == 0;
+            const bool lightdm_inactive =
+                system("/usr/bin/systemctl is-active --quiet lightdm.service "
+                       ">/dev/null 2>&1") != 0;
+            const bool guard_ready =
+                access("/run/streamplayer-resource-guard/display/ready", F_OK) == 0;
+            if (guard_active && guard_ready && lightdm_inactive) {
+                const long long mem_available = meminfo_kilobytes("MemAvailable:");
+                const long long cma_free = meminfo_kilobytes("CmaFree:");
+                const long long swap_free = meminfo_kilobytes("SwapFree:");
+                app_log("HDMI KMS exclusive acquired MemAvailable_kB=" +
+                        std::to_string(mem_available) +
+                        " CmaFree_kB=" + std::to_string(cma_free) +
+                        " SwapFree_kB=" + std::to_string(swap_free));
+                if ((mem_available >= 0 && mem_available < 16 * 1024) ||
+                    (cma_free >= 0 && cma_free < 12 * 1024)) {
+                    error = "系统可用内存不足，已停止本次播放；LightDM 将在退出应用后恢复。";
+                    app_log("HDMI KMS exclusive rejected low memory");
+                    release_kms_exclusive();
+                    return false;
+                }
+                return true;
+            }
+            usleep(50000);
+        }
+        error = "等待 lightdm 释放 HDMI 超时。";
+        app_log("HDMI KMS exclusive wait lightdm inactive timed out");
+        release_kms_exclusive();
+        return false;
+    }
+
+    void release_kms_exclusive()
+    {
+        if (!kms_exclusive_) return;
+        /*
+         * The display guard belongs to the StreamPlayer foreground lifetime,
+         * not to an individual playback pipeline.  Clearing this local lease
+         * must not restart LightDM underneath the still-running app.
+         */
+        kms_exclusive_ = false;
+        preserve_kms_on_next_stop_ = false;
+        app_log("HDMI KMS pipeline lease released; display guard retained until app exit");
+    }
+
     bool launch_desktop_player(const std::string &url, const std::string &token,
                                std::string &error, bool keep_open, bool video_mode,
                                long long start_seconds)
     {
         app_log("HdmiPlayer desktop dispatch mpv=" + bool_text(command_exists("mpv")) +
                 " ffplay=" + bool_text(command_exists("ffplay")) +
+                " gstreamer=" + bool_text(command_exists("gst-launch-1.0")) +
                 " cvlc=" + bool_text(command_exists("cvlc")) +
                 " vlc=" + bool_text(command_exists("vlc")));
+        if (video_mode && command_exists("gst-launch-1.0")) return launch_gstreamer_wayland(url, error, start_seconds);
         if (command_exists("mpv")) return launch_mpv(url, token, error, keep_open, start_seconds);
+        if (video_mode && command_exists("cvlc")) return launch_simple("cvlc", url, error, keep_open, video_mode, start_seconds);
+        if (video_mode && command_exists("vlc")) return launch_simple("vlc", url, error, keep_open, video_mode, start_seconds);
         if (command_exists("ffplay")) return launch_simple("ffplay", url, error, keep_open, video_mode, start_seconds);
         if (command_exists("cvlc")) return launch_simple("cvlc", url, error, keep_open, video_mode, start_seconds);
         if (command_exists("vlc")) return launch_simple("vlc", url, error, keep_open, video_mode, start_seconds);
@@ -2432,6 +3607,7 @@ private:
             prepare_child_process();
             setup_desktop_environment();
             setup_audio_output_environment(audio_output_);
+            drop_to_desktop_user();
             std::string header = "X-Emby-Token: " + token;
             std::vector<std::string> args = {
                 "mpv", "--fs", "--no-terminal",
@@ -2454,9 +3630,141 @@ private:
         return true;
     }
 
+    bool launch_gstreamer_kms(const std::string &url, std::string &error, long long start_seconds)
+    {
+        if (!gstreamer_kms_ready(error)) {
+            app_log("HdmiPlayer gstreamer-kms unavailable error=" + error);
+            return false;
+        }
+        prepare_hdmi_output_mode();
+        if (!acquire_kms_exclusive(error)) return false;
+        std::string connector_id = hdmi_drm_connector_id();
+        pid_ = fork();
+        if (pid_ < 0) {
+            error = "fork failed.";
+            app_log("HdmiPlayer gstreamer-kms fork failed");
+            release_kms_exclusive();
+            return false;
+        }
+        if (pid_ == 0) {
+            prepare_child_process();
+            setup_audio_output_environment(audio_output_);
+            setenv("GST_PLUGIN_FEATURE_RANK", "v4l2h264dec:PRIMARY,avdec_h264:SECONDARY", 1);
+            std::vector<std::string> args = {
+                "gst-launch-1.0", "-e", "-m", "playbin",
+                "uri=" + url,
+                "flags=0x717",
+                "buffer-duration=" + std::to_string(kGstreamerBufferDurationNs),
+                "buffer-size=" + std::to_string(kGstreamerBufferSizeBytes),
+                "video-sink=kmssink connector-id=" + connector_id + " force-modesetting=true sync=true",
+                "audio-sink=alsasink device=" + alsa_output_device(audio_output_) + " sync=true"
+            };
+            exec_args(args);
+            _exit(127);
+        }
+        backend_ = "gstreamer-kms";
+        started_monotonic_ms_ = monotonic_ms();
+        last_start_offset_supported_ = start_seconds <= 0;
+        app_log("HdmiPlayer gstreamer-kms started pid=" +
+                std::to_string(static_cast<long long>(pid_)) +
+                " start_seconds=" + std::to_string(start_seconds) +
+                " connector_id=" + connector_id +
+                " audio_device=" + alsa_output_device(audio_output_));
+        return true;
+    }
+
+    bool launch_gstreamer_wayland(const std::string &url, std::string &error, long long start_seconds)
+    {
+        prepare_hdmi_output_mode();
+        pid_ = fork();
+        if (pid_ < 0) {
+            error = "fork failed.";
+            app_log("HdmiPlayer gstreamer-wayland fork failed");
+            return false;
+        }
+        if (pid_ == 0) {
+            prepare_child_process();
+            setup_desktop_environment();
+            setup_audio_output_environment(audio_output_);
+            setenv("GST_PLUGIN_FEATURE_RANK", "v4l2h264dec:PRIMARY,avdec_h264:SECONDARY", 1);
+            drop_to_desktop_user();
+            std::vector<std::string> args = {
+                "gst-launch-1.0", "-e", "-m", "playbin",
+                "uri=" + url,
+                "flags=0x717",
+                "buffer-duration=" + std::to_string(kGstreamerBufferDurationNs),
+                "buffer-size=" + std::to_string(kGstreamerBufferSizeBytes),
+                "video-sink=waylandsink fullscreen=true",
+                "audio-sink=alsasink device=" + alsa_output_device(audio_output_)
+            };
+            exec_args(args);
+            _exit(127);
+        }
+        backend_ = "gstreamer";
+        started_monotonic_ms_ = monotonic_ms();
+        last_start_offset_supported_ = start_seconds <= 0;
+        app_log("HdmiPlayer gstreamer-wayland started pid=" +
+                std::to_string(static_cast<long long>(pid_)) +
+                " start_seconds=" + std::to_string(start_seconds) +
+                " audio_device=" + alsa_output_device(audio_output_));
+        return true;
+    }
+
+    bool launch_gstreamer_small_fbdev(const std::string &url, std::string &error,
+                                      long long start_seconds, bool video_mode)
+    {
+        if (!video_mode) {
+            error = "小屏播放仅用于视频。";
+            return false;
+        }
+        /*
+         * The HDMI desktop is unrelated to the built-in LCD but consumes a
+         * significant portion of RAM/CMA on the 256 MiB board. Release it
+         * during small-screen video as well, then restore it in stop().
+         */
+        if (!acquire_kms_exclusive(error)) return false;
+        std::string fbdev = small_lcd_fbdev_path();
+        pid_ = fork();
+        if (pid_ < 0) {
+            error = "fork failed.";
+            app_log("HdmiPlayer small-gstreamer fork failed");
+            release_kms_exclusive();
+            return false;
+        }
+        if (pid_ == 0) {
+            prepare_child_process();
+            setup_audio_output_environment(AudioOutput::Speaker);
+            setenv("GST_PLUGIN_FEATURE_RANK", "v4l2h264dec:PRIMARY,avdec_h264:SECONDARY", 1);
+            std::vector<std::string> args = {
+                "gst-launch-1.0", "-e", "-m", "playbin",
+                "uri=" + url,
+                "flags=0x717",
+                "buffer-duration=" + std::to_string(kGstreamerBufferDurationNs),
+                "buffer-size=" + std::to_string(kGstreamerBufferSizeBytes),
+                "video-sink=fbdevsink device=" + fbdev + " sync=true",
+                "audio-sink=alsasink device=" + local_alsa_output_device() + " sync=true"
+            };
+            exec_args(args);
+            _exit(127);
+        }
+        backend_ = "small-gstreamer";
+        started_monotonic_ms_ = monotonic_ms();
+        last_start_offset_supported_ = start_seconds <= 0;
+        app_log("HdmiPlayer small-gstreamer started pid=" +
+                std::to_string(static_cast<long long>(pid_)) +
+                " fbdev=" + fbdev +
+                " start_seconds=" + std::to_string(start_seconds) +
+                " audio_device=" + local_alsa_output_device());
+        return true;
+    }
+
     bool launch_ffmpeg_fbdev(const std::string &url, const std::string &token,
                              std::string &error, long long start_seconds)
     {
+        if (!ffmpeg_fbdev_ready(error)) {
+            app_log("HdmiPlayer ffmpeg-fbdev unavailable error=" + error);
+            return false;
+        }
         pid_ = fork();
         if (pid_ < 0) {
             error = "fork failed.";
@@ -2471,6 +3779,7 @@ private:
                              "pad=2048:1080:(ow-iw)/2:(oh-ih)/2,format=rgb565le";
             std::vector<std::string> args = {
                 "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-re",
+                "-c:v", "h264_v4l2m2m",
             };
             if (!token.empty()) {
                 args.push_back("-headers");
@@ -2482,7 +3791,10 @@ private:
             }
             args.push_back("-i");
             args.push_back(url);
-            args.insert(args.end(), {"-an", "-vf", vf, "-pix_fmt", "rgb565le", "-f", "fbdev", "/dev/fb0"});
+            args.insert(args.end(), {
+                "-map", "0:v:0", "-vf", vf, "-pix_fmt", "rgb565le", "-f", "fbdev", "/dev/fb0",
+                "-map", "0:a:0?", "-ac", "2", "-ar", "48000", "-f", "alsa", alsa_output_device(audio_output_)
+            });
             exec_args(args);
             _exit(127);
         }
@@ -2502,6 +3814,10 @@ private:
             error = "小屏播放仅用于视频。";
             return false;
         }
+        if (!ffmpeg_fbdev_ready(error)) {
+            app_log("HdmiPlayer small-fbdev unavailable error=" + error);
+            return false;
+        }
         pid_ = fork();
         if (pid_ < 0) {
             error = "fork failed.";
@@ -2517,6 +3833,7 @@ private:
                              "pad=320:170:(ow-iw)/2:(oh-ih)/2,format=rgb565le";
             std::vector<std::string> args = {
                 "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-re",
+                "-c:v", "h264_v4l2m2m",
             };
             if (!token.empty()) {
                 args.push_back("-headers");
@@ -2557,13 +3874,13 @@ private:
             prepare_child_process();
             setup_desktop_environment();
             setup_audio_output_environment(audio_output_);
+            drop_to_desktop_user();
             if (strcmp(cmd, "ffplay") == 0) {
                 std::vector<std::string> args = {"ffplay", "-fs"};
                 if (video_mode && !keep_open) {
                     args.insert(args.end(), {"-autoexit", "-loglevel", "warning",
                                              "-framedrop", "-probesize", "1048576",
-                                             "-analyzeduration", "2000000",
-                                             "-codec:v", "h264_v4l2m2m"});
+                                             "-analyzeduration", "2000000"});
                 } else if (keep_open) {
                     args.insert(args.end(), {"-loop", "0", "-loglevel", "warning"});
                 } else {
@@ -2580,11 +3897,27 @@ private:
                     "cvlc", "-I", "dummy", "--no-video-title-show", "--no-osd",
                     "--play-and-exit", "--fullscreen",
                 };
+                if (video_mode) {
+                    args.insert(args.end(), {
+                        "--codec", "faad,avcodec",
+                        "--avcodec-codec=h264",
+                        "--avcodec-hw=none",
+                        "-V", "wl_shm",
+                    });
+                }
                 if (start_seconds > 0) args.push_back("--start-time=" + seconds_arg(start_seconds));
                 args.push_back(url);
                 exec_args(args);
             } else {
                 std::vector<std::string> args = {cmd, "--fullscreen"};
+                if (video_mode && strcmp(cmd, "vlc") == 0) {
+                    args.insert(args.end(), {
+                        "--codec", "faad,avcodec",
+                        "--avcodec-codec=h264",
+                        "--avcodec-hw=none",
+                        "-V", "wl_shm",
+                    });
+                }
                 if (strcmp(cmd, "vlc") == 0 && start_seconds > 0) {
                     args.push_back("--start-time=" + seconds_arg(start_seconds));
                 }
@@ -2618,11 +3951,46 @@ private:
         return ok;
     }
 
+    static std::string temporary_seek_playlist_from_url(const std::string &url)
+    {
+        constexpr const char *prefix = "file:///tmp/m5streamplayer-seek-";
+        if (url.compare(0, strlen(prefix), prefix) != 0 ||
+            url.size() < 5 || url.compare(url.size() - 5, 5, ".m3u8") != 0) {
+            return std::string();
+        }
+        return url.substr(strlen("file://"));
+    }
+
+    void cleanup_temporary_seek_playlist()
+    {
+        if (temporary_seek_playlist_.empty()) return;
+        if (unlink(temporary_seek_playlist_.c_str()) == 0 || errno == ENOENT) {
+            app_log("HLS seek playlist removed path=" + temporary_seek_playlist_);
+        } else {
+            app_log("HLS seek playlist cleanup failed path=" +
+                    temporary_seek_playlist_ +
+                    " error=" + strerror(errno));
+        }
+        temporary_seek_playlist_.clear();
+    }
+
     pid_t pid_ = -1;
     std::string backend_;
+    std::string temporary_seek_playlist_;
     bool paused_ = false;
     AudioOutput audio_output_ = AudioOutput::Speaker;
     bool last_start_offset_supported_ = true;
+    bool kms_exclusive_ = false;
+    bool preserve_kms_on_next_stop_ = false;
+    bool ready_ = false;
+    bool buffering_ = false;
+    bool playing_seen_ = false;
+    bool hardware_decoder_active_ = false;
+    std::string hardware_decoder_device_;
+    uint64_t started_monotonic_ms_ = 0;
+    std::streamoff gstreamer_log_offset_ = 0;
+    std::string gstreamer_log_tail_;
+    uint64_t last_gstreamer_refresh_ms_ = 0;
 };
 
 class MediaController {
@@ -2631,10 +3999,30 @@ public:
     {
         app_log("MediaController init pid=" + std::to_string(static_cast<long long>(getpid())) +
                 " version=" + kAppVersion +
-                " config_path=" + config_path());
+                " config_path=" + config_path() +
+                " poster_cache=" + poster_cache_dir());
+        (void)acquire_background_performance_mode();
+        /*
+         * Apply the requested HDMI mode while LightDM's Wayland compositor is
+         * still available. The foreground display guard stops it immediately
+         * afterward and leaves APPLaunch's independent LCD framebuffer alone.
+         */
+        prepare_hdmi_output_mode();
+        (void)acquire_display_performance_mode();
         init_runtime_fonts();
         config_loaded_ = load_config(config_);
-        if (config_.base_url.empty()) config_.base_url = kDefaultServerUrl;
+        const char *server_url_env = getenv(kServerUrlEnv);
+        const char *username_env = getenv(kUsernameEnv);
+        const char *password_env = getenv(kPasswordEnv);
+        if (config_.base_url.empty() && server_url_env && *server_url_env) {
+            config_.base_url = server_url_env;
+        }
+        if (config_.username.empty() && username_env && *username_env) {
+            config_.username = username_env;
+        }
+        if (config_.password.empty() && password_env && *password_env) {
+            config_.password = password_env;
+        }
         if (config_.language.empty()) config_.language = language_code(language_from_code(system_language_code()));
         app_log("Config loaded=" + bool_text(config_loaded_) +
                 " server=" + server_name(config_.type) +
@@ -2687,7 +4075,148 @@ public:
         }
     }
 
+    void shutdown()
+    {
+        if (shutting_down_) return;
+        shutting_down_ = true;
+        app_log("MediaController shutdown requested");
+        stop_player_timer();
+        if (esc_short_timer_) {
+            lv_timer_delete(esc_short_timer_);
+            esc_short_timer_ = nullptr;
+        }
+        if (control_timer_) {
+            lv_timer_delete(control_timer_);
+            control_timer_ = nullptr;
+        }
+
+        playback_paused_seconds_ = current_playback_seconds();
+        playback_paused_ = true;
+        playback_buffering_ = false;
+        player_.stop();
+        report_playback_stopped();
+        restore_display_performance_mode();
+        restore_background_performance_mode();
+
+        if (control_fd_ >= 0) {
+            close(control_fd_);
+            control_fd_ = -1;
+        }
+        if (control_keepalive_fd_ >= 0) {
+            close(control_keepalive_fd_);
+            control_keepalive_fd_ = -1;
+        }
+        unlink(kControlPipe);
+        app_log("MediaController shutdown complete");
+    }
+
 private:
+    bool acquire_background_performance_mode()
+    {
+        const char *keep_packagekit = getenv("M5_STREAMPLAYER_KEEP_PACKAGEKIT");
+        if (keep_packagekit &&
+            (strcmp(keep_packagekit, "1") == 0 ||
+             strcmp(keep_packagekit, "true") == 0)) {
+            app_log("PackageKit performance pause skipped by environment");
+            return true;
+        }
+
+        const char *systemctl = getuid() == 0
+            ? "/usr/bin/systemctl"
+            : "/usr/bin/sudo -n /usr/bin/systemctl";
+        const std::string start_guard =
+            std::string(systemctl) +
+            " start streamplayer-background-guard.service >/dev/null 2>&1";
+        const int rc = system(start_guard.c_str());
+        if (rc == 0) background_guard_requested_ = true;
+        bool packagekit_inactive = false;
+        if (rc == 0) {
+            for (int i = 0; i < 100; ++i) {
+                const bool guard_active =
+                    system("/usr/bin/systemctl is-active --quiet "
+                           "streamplayer-background-guard.service "
+                           ">/dev/null 2>&1") == 0;
+                const bool service_inactive =
+                    system("/usr/bin/systemctl is-active --quiet packagekit.service "
+                           ">/dev/null 2>&1") != 0;
+                const bool service_masked =
+                    guard_active && service_inactive &&
+                    first_command_line(
+                        "/usr/bin/systemctl show packagekit.service "
+                        "--property=LoadState --value 2>/dev/null") == "masked";
+                const bool guard_ready =
+                    access("/run/streamplayer-resource-guard/background/ready",
+                           F_OK) == 0;
+                if (guard_active && guard_ready &&
+                    service_inactive && service_masked) {
+                    packagekit_inactive = true;
+                    break;
+                }
+                usleep(50000);
+            }
+        }
+        app_log("PackageKit background guard start rc=" + std::to_string(rc) +
+                " inactive=" + bool_text(packagekit_inactive));
+        return packagekit_inactive;
+    }
+
+    void restore_background_performance_mode()
+    {
+        if (!background_guard_requested_) return;
+        background_guard_requested_ = false;
+        app_log("PackageKit background guard will restore after process exit");
+    }
+
+    bool acquire_display_performance_mode()
+    {
+        const char *keep_lightdm = getenv("M5_STREAMPLAYER_KEEP_LIGHTDM");
+        if (keep_lightdm &&
+            (strcmp(keep_lightdm, "1") == 0 ||
+             strcmp(keep_lightdm, "true") == 0)) {
+            app_log("LightDM performance pause skipped by environment");
+            return true;
+        }
+
+        const char *systemctl = getuid() == 0
+            ? "/usr/bin/systemctl"
+            : "/usr/bin/sudo -n /usr/bin/systemctl";
+        const std::string start_guard =
+            std::string(systemctl) +
+            " start streamplayer-display-guard.service >/dev/null 2>&1";
+        const int rc = system(start_guard.c_str());
+        if (rc == 0) display_guard_requested_ = true;
+        bool lightdm_inactive = false;
+        if (rc == 0) {
+            for (int i = 0; i < 100; ++i) {
+                const bool guard_active =
+                    system("/usr/bin/systemctl is-active --quiet "
+                           "streamplayer-display-guard.service "
+                           ">/dev/null 2>&1") == 0;
+                const bool service_inactive =
+                    system("/usr/bin/systemctl is-active --quiet lightdm.service "
+                           ">/dev/null 2>&1") != 0;
+                const bool guard_ready =
+                    access("/run/streamplayer-resource-guard/display/ready",
+                           F_OK) == 0;
+                if (guard_active && guard_ready && service_inactive) {
+                    lightdm_inactive = true;
+                    break;
+                }
+                usleep(50000);
+            }
+        }
+        app_log("LightDM display guard start rc=" + std::to_string(rc) +
+                " inactive=" + bool_text(lightdm_inactive));
+        return lightdm_inactive;
+    }
+
+    void restore_display_performance_mode()
+    {
+        if (!display_guard_requested_) return;
+        display_guard_requested_ = false;
+        app_log("LightDM display guard will restore after process exit");
+    }
+
     UiLanguage current_language() const
     {
         return language_from_code(config_.language.empty() ? system_language_code() : config_.language);
@@ -2723,6 +4252,7 @@ private:
         if (!self) return;
         lv_obj_t *target = static_cast<lv_obj_t *>(lv_event_get_target(event));
         if (target == self->login_btn_) self->login_from_setup();
+        else if (target == self->scan_btn_) self->start_lan_scan();
         else if (target == self->logout_btn_) self->logout();
         else if (target == self->small_screen_btn_ ||
                  (target && lv_obj_get_parent(target) == self->small_screen_btn_)) {
@@ -2735,6 +4265,16 @@ private:
         auto *self = static_cast<MediaController *>(lv_event_get_user_data(event));
         if (!self) return;
         lv_obj_t *target = static_cast<lv_obj_t *>(lv_event_get_target(event));
+        if (lv_event_get_code(event) == LV_EVENT_READY) {
+            self->style_dropdown_list(target);
+            return;
+        }
+        if (lv_event_get_code(event) == LV_EVENT_CANCEL) {
+            return;
+        }
+        if (lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) return;
+        if (lv_dropdown_is_open(target)) return;
+
         if (target == self->server_dropdown_) {
             self->config_.type = lv_dropdown_get_selected(target) == 1
                 ? ServerType::Emby
@@ -2742,10 +4282,43 @@ private:
             save_config(self->config_);
             self->show_setup();
         } else if (target == self->language_dropdown_) {
-            self->config_.language = lv_dropdown_get_selected(target) == 1 ? "zh-CN" : "en";
+            self->config_.language = language_code(language_from_selected(lv_dropdown_get_selected(target)));
             save_config(self->config_);
             self->show_setup();
         }
+    }
+
+    void style_dropdown_list(lv_obj_t *dropdown)
+    {
+        if (!dropdown) return;
+        lv_obj_t *list = lv_dropdown_get_list(dropdown);
+        if (!list) return;
+        lv_obj_set_style_radius(list, 7, 0);
+        lv_obj_set_style_bg_color(list, lv_color_hex(0x0A1017), 0);
+        lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(list, 1, 0);
+        lv_obj_set_style_border_color(list, lv_color_hex(0x223144), 0);
+        lv_obj_set_style_border_opa(list, LV_OPA_COVER, 0);
+        lv_obj_set_style_outline_width(list, 0, 0);
+        lv_obj_set_style_outline_width(list, 0, LV_PART_SELECTED);
+        lv_obj_set_style_outline_width(list, 0, LV_PART_MAIN);
+        lv_obj_set_style_shadow_width(list, 10, 0);
+        lv_obj_set_style_shadow_color(list, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_shadow_opa(list, 100, 0);
+        lv_obj_set_style_text_color(list, lv_color_hex(0xE4E9F0), 0);
+        lv_obj_set_style_text_font(list, ui_font_14(), 0);
+        lv_obj_set_style_pad_all(list, 5, 0);
+        lv_obj_set_style_max_height(list, 108, 0);
+        lv_obj_set_style_max_width(list, 156, 0);
+        lv_obj_set_style_bg_color(list, accent_color(config_.type), LV_PART_SELECTED);
+        lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SELECTED);
+        lv_obj_set_style_text_color(list, lv_color_hex(0xFFFFFF), LV_PART_SELECTED);
+        lv_obj_set_style_bg_color(list, accent_color(config_.type), LV_PART_SELECTED | LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SELECTED | LV_STATE_PRESSED);
+        lv_obj_set_style_text_color(list, lv_color_hex(0xFFFFFF), LV_PART_SELECTED | LV_STATE_PRESSED);
+        lv_obj_set_style_bg_color(list, accent_color(config_.type), LV_PART_SELECTED | LV_STATE_CHECKED);
+        lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SELECTED | LV_STATE_CHECKED);
+        lv_obj_set_style_text_color(list, lv_color_hex(0xFFFFFF), LV_PART_SELECTED | LV_STATE_CHECKED);
     }
 
     static void focus_event_cb(lv_event_t *event)
@@ -2816,6 +4389,7 @@ private:
         }
         key = normalize_direction_alias(key);
         if (view_ == View::Setup) handle_setup_key(key);
+        else if (view_ == View::LanHosts) handle_lan_hosts_key(key);
         else if (view_ == View::Browse) handle_browse_key(key);
         else if (view_ == View::Detail) handle_detail_key(key);
         else if (view_ == View::Player) handle_player_key(key);
@@ -2867,10 +4441,14 @@ private:
 
     void stop_playback_to_detail()
     {
-        report_playback_stopped();
+        playback_paused_seconds_ = current_playback_seconds();
+        playback_paused_ = true;
+        playback_buffering_ = false;
         player_.stop();
+        report_playback_stopped();
         small_screen_playback_ = false;
         playback_paused_ = false;
+        playback_pipeline_ready_ = false;
         render_detail();
     }
 
@@ -2883,7 +4461,13 @@ private:
 
     void perform_escape_action()
     {
-        if (view_ == View::Browse) {
+        if (view_ == View::Setup && (server_dropdown_ && lv_dropdown_is_open(server_dropdown_))) {
+            lv_dropdown_close(server_dropdown_);
+        } else if (view_ == View::Setup && (language_dropdown_ && lv_dropdown_is_open(language_dropdown_))) {
+            lv_dropdown_close(language_dropdown_);
+        } else if (view_ == View::LanHosts) {
+            show_setup();
+        } else if (view_ == View::Browse) {
             LibraryState *state = current_library_state();
             if (state && state->expanded) {
                 reset_expansion(*state);
@@ -2903,24 +4487,7 @@ private:
     void exit_application(const char *reason)
     {
         app_log(std::string("Application exit reason=") + (reason ? reason : "<unknown>"));
-        report_playback_stopped();
-        player_.stop();
-        if (esc_short_timer_) {
-            lv_timer_delete(esc_short_timer_);
-            esc_short_timer_ = nullptr;
-        }
-        if (control_timer_) {
-            lv_timer_delete(control_timer_);
-            control_timer_ = nullptr;
-        }
-        if (control_fd_ >= 0) {
-            close(control_fd_);
-            control_fd_ = -1;
-        }
-        if (control_keepalive_fd_ >= 0) {
-            close(control_keepalive_fd_);
-            control_keepalive_fd_ = -1;
-        }
+        shutdown();
         std::exit(0);
     }
 
@@ -2987,12 +4554,12 @@ private:
         if (stat(kControlPipe, &st) == 0 && !S_ISFIFO(st.st_mode)) {
             unlink(kControlPipe);
         }
-        if (mkfifo(kControlPipe, 0666) != 0 && errno != EEXIST) {
+        if (mkfifo(kControlPipe, 0600) != 0 && errno != EEXIST) {
             app_log(std::string("SSH control mkfifo failed path=") + kControlPipe +
                     " errno=" + std::to_string(errno));
             return;
         }
-        chmod(kControlPipe, 0666);
+        chmod(kControlPipe, 0600);
         control_fd_ = open(kControlPipe, O_RDONLY | O_NONBLOCK);
         if (control_fd_ < 0) {
             app_log(std::string("SSH control open read failed path=") + kControlPipe +
@@ -3041,7 +4608,7 @@ private:
         player_progress_w_ = 0;
     }
 
-    void clear(lv_color_t bg = lv_color_hex(0x05070A))
+    void clear(lv_color_t bg = lv_color_hex(0x04070B))
     {
         stop_player_timer();
         lv_obj_clean(root_);
@@ -3050,6 +4617,7 @@ private:
         small_screen_btn_ = nullptr;
         server_dropdown_ = nullptr;
         language_dropdown_ = nullptr;
+        scan_btn_ = nullptr;
         reset_group();
     }
 
@@ -3135,12 +4703,55 @@ private:
         lv_label_set_text(obj, text);
         lv_label_set_long_mode(obj, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_color(obj, color, 0);
-        lv_obj_set_style_text_font(obj, ui_font_16(), 0);
+        lv_obj_set_style_text_font(obj, ui_font_14(), 0);
         lv_obj_set_style_outline_width(obj, 0, 0);
-        lv_obj_set_style_bg_color(obj, lv_color_hex(0x0D1720), LV_STATE_FOCUSED);
-        lv_obj_set_style_bg_opa(obj, LV_OPA_60, LV_STATE_FOCUSED);
-        lv_obj_set_style_text_color(obj, accent_color(config_.type), LV_STATE_FOCUSED);
-        lv_obj_set_style_radius(obj, 3, LV_STATE_FOCUSED);
+        lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_CENTER, 0);
+        const lv_color_t accent = accent_color(config_.type);
+        const bool primary = lv_color_brightness(color) > 200;
+        lv_obj_set_style_radius(obj, 5, 0);
+        lv_obj_set_style_border_width(obj, 1, 0);
+        lv_obj_set_style_pad_all(obj, 0, 0);
+        /* Vertically center 14px text inside 22px buttons: 22 - 14 = 8px. */
+        lv_obj_set_style_pad_top(obj, 4, 0);
+        lv_obj_set_style_pad_bottom(obj, 4, 0);
+        if (primary) {
+            /* Primary CTA: filled with the server accent; dark text keeps contrast. */
+            lv_obj_set_style_bg_color(obj, accent, 0);
+            lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_color(obj, lv_color_hex(0x487A60), 0);
+            if (lv_color_brightness(accent) > 160) {
+                lv_obj_set_style_border_color(obj, lv_color_hex(0x3D6B52), 0);
+            }
+            lv_obj_set_style_border_opa(obj, LV_OPA_COVER, 0);
+            lv_obj_set_style_text_color(obj, lv_color_hex(0x05100C), 0);
+            lv_obj_set_style_bg_color(obj, lv_color_hex(0x0A1620), LV_STATE_FOCUSED);
+            lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
+            lv_obj_set_style_text_color(obj, accent, LV_STATE_FOCUSED);
+            lv_obj_set_style_border_color(obj, accent, LV_STATE_FOCUSED);
+            lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
+            lv_obj_set_style_bg_color(obj, lv_color_hex(0x3E6A54), LV_STATE_PRESSED);
+            lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_STATE_PRESSED);
+            lv_obj_set_style_text_color(obj, lv_color_hex(0x061018), LV_STATE_PRESSED);
+        } else {
+            /* Secondary/ghost button: quiet hairline chip, no competing fill. */
+    lv_obj_set_style_bg_color(obj, lv_color_hex(0x0A1119), 0);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(obj, lv_color_hex(0x1A2737), 0);
+    lv_obj_set_style_border_opa(obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(obj, lv_color_hex(0x7A8BA0), 0);
+    /* Kill all theme outlines */
+    lv_obj_remove_style(obj, NULL, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(obj, 0, LV_STATE_ANY);
+    lv_obj_set_style_outline_opa(obj, 0, LV_STATE_ANY);
+    lv_obj_set_style_bg_color(obj, lv_color_hex(0x0E1A26), LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(obj, accent, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(obj, accent, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
+    lv_obj_set_style_bg_color(obj, lv_color_hex(0x142232), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(obj, accent, LV_STATE_PRESSED);
+        }
         lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(obj, click_event_cb, LV_EVENT_CLICKED, this);
         lv_obj_add_event_cb(obj, focus_event_cb, LV_EVENT_FOCUSED, this);
@@ -3157,22 +4768,95 @@ private:
         lv_obj_set_size(obj, w, h);
         lv_dropdown_set_options(obj, options);
         lv_dropdown_set_selected(obj, selected);
-        lv_obj_set_style_radius(obj, 4, 0);
-        lv_obj_set_style_border_width(obj, 1, 0);
-        lv_obj_set_style_border_color(obj, accent_color(config_.type), 0);
+        lv_dropdown_set_symbol(obj, "");
+        lv_dropdown_set_selected_highlight(obj, true);
+        lv_obj_set_style_radius(obj, 5, 0);
+        /* Kill all theme-applied outlines (default blue focus/edited ring). */
+        lv_obj_remove_style(obj, NULL, LV_STATE_FOCUS_KEY);
+        lv_obj_remove_style(obj, NULL, LV_STATE_EDITED);
+        lv_obj_set_style_outline_width(obj, 0, LV_STATE_ANY);
+        lv_obj_set_style_outline_opa(obj, 0, LV_STATE_ANY);
         lv_obj_set_style_outline_width(obj, 0, 0);
-        lv_obj_set_style_bg_color(obj, lv_color_hex(0x0C131B), 0);
+        lv_obj_set_style_outline_width(obj, 0, LV_STATE_DEFAULT);
+        lv_obj_set_style_outline_opa(obj, 0, LV_STATE_DEFAULT);
+        lv_obj_set_style_outline_opa(obj, 0, LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_outline_width(obj, 0, LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_border_width(obj, 1, 0);
+        lv_obj_set_style_border_color(obj, lv_color_hex(0x1E2C3C), 0);
+        lv_obj_set_style_border_opa(obj, LV_OPA_COVER, 0);
+        lv_obj_set_style_outline_width(obj, 0, 0);
+        lv_obj_set_style_bg_color(obj, lv_color_hex(0x0A1119), 0);
         lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
         lv_obj_set_style_text_color(obj, lv_color_hex(0xFFFFFF), 0);
         lv_obj_set_style_text_font(obj, ui_font_14(), 0);
-        lv_obj_set_style_pad_left(obj, 6, 0);
-        lv_obj_set_style_pad_top(obj, 1, 0);
-        lv_obj_set_style_bg_color(obj, lv_color_hex(0x101820), LV_STATE_FOCUSED);
-        lv_obj_set_style_text_color(obj, accent_color(config_.type), LV_STATE_FOCUSED);
+        lv_obj_set_style_pad_left(obj, 8, 0);
+        lv_obj_set_style_pad_top(obj, 2, 0);
+        lv_obj_set_style_pad_right(obj, 6, 0);
+        lv_obj_set_style_bg_color(obj, lv_color_hex(0x0E1620), LV_STATE_FOCUSED);
+        lv_obj_set_style_text_color(obj, lv_color_hex(0xFFFFFF), LV_STATE_FOCUSED);
+        lv_obj_set_style_border_color(obj, accent_color(config_.type), LV_STATE_FOCUSED);
+        lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_STATE_FOCUSED);
+        lv_obj_set_style_border_color(obj, accent_color(config_.type), LV_STATE_CHECKED);
+        lv_obj_set_style_text_color(obj, accent_color(config_.type), LV_STATE_CHECKED);
+
+        lv_obj_set_style_border_color(obj, accent_color(config_.type), LV_PART_INDICATOR | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_side(obj, LV_BORDER_SIDE_BOTTOM, LV_STATE_FOCUSED);
+        lv_obj_set_style_border_side(obj, LV_BORDER_SIDE_BOTTOM, LV_PART_INDICATOR | LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_opa(obj, 0, LV_STATE_DEFAULT);
+        lv_obj_set_style_outline_width(obj, 0, LV_STATE_DEFAULT);
+
+        /* Selected-highlight is drawn by draw_box() which queries the dropdown
+         * object (not the list) at LV_PART_SELECTED | LV_STATE_CHECKED.
+         * This gives colored background + white text on the currently-selected
+         * dropdown list item instead of the default blue. */
+        lv_obj_set_style_bg_color(obj, accent_color(config_.type), LV_PART_SELECTED | LV_STATE_CHECKED);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_SELECTED | LV_STATE_CHECKED);
+        lv_obj_set_style_text_color(obj, lv_color_hex(0xFFFFFF), LV_PART_SELECTED | LV_STATE_CHECKED);
+        lv_obj_set_style_bg_color(obj, accent_color(config_.type), LV_PART_SELECTED | LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, LV_PART_SELECTED | LV_STATE_PRESSED);
+        lv_obj_set_style_text_color(obj, lv_color_hex(0xFFFFFF), LV_PART_SELECTED | LV_STATE_PRESSED);
+
+        lv_obj_t *list = lv_dropdown_get_list(obj);
+        if (list) {
+            lv_obj_set_style_radius(list, 7, 0);
+            lv_obj_set_style_bg_color(list, lv_color_hex(0x0A1017), 0);
+            lv_obj_set_style_bg_opa(list, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(list, 1, 0);
+            lv_obj_set_style_border_color(list, lv_color_hex(0x223144), 0);
+            lv_obj_set_style_border_opa(list, LV_OPA_COVER, 0);
+            lv_obj_set_style_outline_width(list, 0, 0);
+            lv_obj_set_style_shadow_width(list, 10, 0);
+            lv_obj_set_style_shadow_color(list, lv_color_hex(0x000000), 0);
+            lv_obj_set_style_shadow_opa(list, 100, 0);
+            lv_obj_set_style_text_color(list, lv_color_hex(0xE4E9F0), 0);
+            lv_obj_set_style_text_font(list, ui_font_14(), 0);
+            lv_obj_set_style_pad_all(list, 5, 0);
+            lv_obj_set_style_pad_top(list, 4, 0);
+            lv_obj_set_style_pad_bottom(list, 4, 0);
+            lv_obj_set_style_text_line_space(list, 2, 0);
+            lv_obj_set_style_max_height(list, 108, 0);
+            lv_obj_set_style_max_width(list, 156, 0);
+            lv_obj_set_style_bg_color(list, accent_color(config_.type), LV_PART_SELECTED);
+            lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SELECTED);
+            lv_obj_set_style_text_color(list, lv_color_hex(0xFFFFFF), LV_PART_SELECTED);
+            lv_obj_set_style_bg_color(list, accent_color(config_.type), LV_PART_SELECTED | LV_STATE_PRESSED);
+            lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SELECTED | LV_STATE_PRESSED);
+            lv_obj_set_style_text_color(list, lv_color_hex(0xFFFFFF), LV_PART_SELECTED | LV_STATE_PRESSED);
+            lv_obj_set_style_bg_color(list, accent_color(config_.type), LV_PART_SELECTED | LV_STATE_CHECKED);
+            lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_PART_SELECTED | LV_STATE_CHECKED);
+            lv_obj_set_style_text_color(list, lv_color_hex(0xFFFFFF), LV_PART_SELECTED | LV_STATE_CHECKED);
+        }
+
         lv_obj_add_event_cb(obj, setup_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, this);
         lv_obj_add_event_cb(obj, focus_event_cb, LV_EVENT_FOCUSED, this);
         lv_obj_add_event_cb(obj, focus_event_cb, LV_EVENT_DEFOCUSED, this);
+        lv_obj_add_event_cb(obj, setup_dropdown_event_cb, LV_EVENT_READY, this);
+        lv_obj_add_event_cb(obj, setup_dropdown_event_cb, LV_EVENT_CANCEL, this);
         add_to_group(obj);
+
+        /* Enable selected highlight so accent-color renders instead of default blue */
+        lv_dropdown_set_selected_highlight(obj, true);
+
         return obj;
     }
 
@@ -3197,19 +4881,34 @@ private:
         lv_textarea_set_one_line(ta, true);
         lv_textarea_set_placeholder_text(ta, placeholder);
         lv_textarea_set_password_mode(ta, password);
-        lv_obj_set_style_radius(ta, 0, 0);
-        lv_obj_set_style_border_width(ta, 0, 0);
+        lv_obj_set_style_radius(ta, 5, 0);
+        /* Kill all theme-applied outlines (default blue focus/edited ring). */
+        lv_obj_remove_style(ta, NULL, LV_STATE_FOCUS_KEY);
+        lv_obj_remove_style(ta, NULL, LV_STATE_EDITED);
+        lv_obj_set_style_outline_width(ta, 0, LV_STATE_ANY);
+        lv_obj_set_style_outline_opa(ta, 0, LV_STATE_ANY);
+        lv_obj_set_style_border_width(ta, 1, 0);
+        lv_obj_set_style_border_color(ta, lv_color_hex(0x1E2C3C), 0);
+        lv_obj_set_style_border_opa(ta, LV_OPA_COVER, 0);
         lv_obj_set_style_outline_width(ta, 0, 0);
-        lv_obj_set_style_bg_opa(ta, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_outline_width(ta, 0, LV_STATE_DEFAULT);
+        lv_obj_set_style_outline_opa(ta, 0, LV_STATE_DEFAULT);
+        lv_obj_set_style_outline_opa(ta, 0, LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_outline_width(ta, 0, LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_bg_color(ta, lv_color_hex(0x0A1119), 0);
+        lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
         lv_obj_set_style_text_color(ta, lv_color_hex(0xFFFFFF), 0);
         lv_obj_set_style_text_font(ta, ui_font_14(), 0);
-        lv_obj_set_style_bg_color(ta, lv_color_hex(0x0C131B), LV_STATE_FOCUSED);
-        lv_obj_set_style_bg_opa(ta, LV_OPA_70, LV_STATE_FOCUSED);
-        lv_obj_set_style_text_color(ta, accent_color(config_.type), LV_STATE_FOCUSED);
+        lv_obj_set_style_border_color(ta, accent_color(config_.type), LV_STATE_FOCUSED);
+        lv_obj_set_style_bg_color(ta, lv_color_hex(0x0E1720), LV_STATE_FOCUSED);
+        lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, LV_STATE_FOCUSED);
+        lv_obj_set_style_text_color(ta, lv_color_hex(0xFFFFFF), LV_STATE_FOCUSED);
+        lv_obj_set_style_border_side(ta, LV_BORDER_SIDE_BOTTOM, LV_STATE_FOCUSED);
         lv_obj_set_style_bg_color(ta, accent_color(config_.type), LV_PART_CURSOR);
         lv_obj_set_style_width(ta, 2, LV_PART_CURSOR);
         lv_obj_set_style_pad_all(ta, 0, 0);
-        lv_obj_set_style_pad_top(ta, 2, 0);
+        lv_obj_set_style_pad_left(ta, 8, 0);
+        lv_obj_set_style_pad_top(ta, 4, 0);
         lv_obj_add_event_cb(ta, focus_event_cb, LV_EVENT_FOCUSED, this);
         lv_obj_add_event_cb(ta, focus_event_cb, LV_EVENT_DEFOCUSED, this);
         add_to_group(ta);
@@ -3222,22 +4921,28 @@ private:
 
         lv_obj_t *focused = focused_obj();
         int y = -1;
-        int h = 18;
-        if (focused == server_dropdown_ || focused == language_dropdown_) {
-            y = 16;
-            h = 18;
+        int h = 2;
+        if (focused == server_dropdown_) {
+            y = 50;
+            h = 2;
+        } else if (focused == language_dropdown_) {
+            y = 50;
+            h = 2;
         } else if (focused == url_ta_) {
-            y = 41;
-            h = 22;
+            y = 74;
+            h = 2;
         } else if (focused == user_ta_) {
-            y = 73;
-            h = 22;
+            y = 96;
+            h = 2;
         } else if (focused == pass_ta_) {
-            y = 105;
-            h = 22;
+            y = 96;
+            h = 2;
         } else if (focused == login_btn_) {
-            y = 143;
-            h = 18;
+            y = 138;
+            h = 2;
+        } else if (focused == scan_btn_) {
+            y = 138;
+            h = 2;
         }
 
         if (y < 0) {
@@ -3246,52 +4951,115 @@ private:
         }
 
         lv_obj_clear_flag(setup_focus_marker_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_width(setup_focus_marker_, 272);
         lv_obj_set_y(setup_focus_marker_, y);
         lv_obj_set_height(setup_focus_marker_, h);
+        lv_obj_set_x(setup_focus_marker_, 20);
+        lv_obj_set_style_radius(setup_focus_marker_, 1, 0);
         lv_obj_set_style_bg_color(setup_focus_marker_, accent_color(config_.type), 0);
+        lv_obj_set_style_bg_opa(setup_focus_marker_, 220, 0);
     }
 
     void set_status(const std::string &text)
     {
-        if (status_) lv_label_set_text(status_, text.c_str());
+        if (!status_) return;
+        lv_label_set_text(status_, text.c_str());
+        lv_obj_set_style_text_color(status_, lv_color_hex(0xFF9B9B), 0);
+        lv_obj_clear_flag(status_, LV_OBJ_FLAG_HIDDEN);
     }
 
     void show_setup()
     {
         view_ = View::Setup;
-        clear();
-        setup_focus_marker_ = lv_obj_create(root_);
-        lv_obj_set_pos(setup_focus_marker_, 8, 16);
-        lv_obj_set_size(setup_focus_marker_, 3, 18);
+        clear(lv_color_hex(0x020409));
+        lv_obj_set_style_bg_grad_color(root_, lv_color_hex(0x070C13), 0);
+        lv_obj_set_style_bg_grad_dir(root_, LV_GRAD_DIR_VER, 0);
+
+        /* ============ Card ============ */
+        lv_obj_t *card = lv_obj_create(root_);
+        lv_obj_set_pos(card, 3, 2);
+        lv_obj_set_size(card, 314, 165);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(card, 10, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x0A0F16), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x172431), 0);
+        lv_obj_set_style_shadow_width(card, 14, 0);
+        lv_obj_set_style_shadow_color(card, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_shadow_opa(card, 120, 0);
+        lv_obj_set_style_pad_all(card, 0, 0);
+
+        /* ============ Header (brand + service/language in one compact area) ============ */
+        lv_obj_t *header = lv_obj_create(card);
+        lv_obj_set_pos(header, 0, 0);
+        lv_obj_set_size(header, 314, 48);
+        lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(header, 10, 0);
+        lv_obj_set_style_bg_color(header, lv_color_hex(0x0C121A), 0);
+        lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(header, 0, 0);
+        lv_obj_set_style_pad_all(header, 0, 0);
+
+        /* Brand row */
+        lv_obj_t *brand_mark = lv_obj_create(header);
+        lv_obj_set_pos(brand_mark, 12, 5);
+        lv_obj_set_size(brand_mark, 16, 16);
+        lv_obj_clear_flag(brand_mark, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(brand_mark, 4, 0);
+        lv_obj_set_style_bg_color(brand_mark, accent_color(config_.type), 0);
+        lv_obj_set_style_bg_opa(brand_mark, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(brand_mark, 0, 0);
+        label(header, "StreamPlayer", 34, 3, 150, 20, lv_color_hex(0xEAF1F8), ui_font_16());
+        label(header, "Jellyfin \xc2\xb7 Emby", 186, 5, 116, 16, lv_color_hex(0x5A6A7C), ui_font_14());
+
+        /* Service + language controls */
+        label(header, t(TextKey::Server), 12, 31, 52, 18, lv_color_hex(0x8B9AAE));
+        server_dropdown_ = dropdown(header, "Jellyfin\nEmby",
+                                    config_.type == ServerType::Emby ? 1 : 0,
+                                    64, 29, 64, 18);
+        label(header, t(TextKey::Language), 136, 31, 72, 18, lv_color_hex(0x8B9AAE));
+        language_dropdown_ = dropdown(header, "English\n中文\n日本語",
+                                      current_language() == UiLanguage::Chinese ? 1 :
+                                      (current_language() == UiLanguage::Japanese ? 2 : 0),
+                                    208, 29, 94, 18);
+
+        rule(card, 12, 48, 290, lv_color_hex(0x16222E));
+
+        /* ============ Focus marker ============ */
+        setup_focus_marker_ = lv_obj_create(card);
+        lv_obj_set_pos(setup_focus_marker_, 12, 50);
+        lv_obj_set_size(setup_focus_marker_, 290, 2);
         lv_obj_clear_flag(setup_focus_marker_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_border_width(setup_focus_marker_, 0, 0);
-        lv_obj_set_style_radius(setup_focus_marker_, 2, 0);
+        lv_obj_set_style_radius(setup_focus_marker_, 1, 0);
         lv_obj_set_style_bg_color(setup_focus_marker_, accent_color(config_.type), 0);
-        lv_obj_set_style_bg_opa(setup_focus_marker_, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_opa(setup_focus_marker_, 220, 0);
 
-        label(root_, t(TextKey::Server), 18, 18, 42, 16, lv_color_hex(0x7F8D9D));
-        server_dropdown_ = dropdown(root_, "Jellyfin\nEmby",
-                                    config_.type == ServerType::Emby ? 1 : 0,
-                                    62, 14, 92, 24);
-        label(root_, t(TextKey::Language), 166, 18, 42, 16, lv_color_hex(0x7F8D9D));
-        language_dropdown_ = dropdown(root_, "English\n中文",
-                                      current_language() == UiLanguage::Chinese ? 1 : 0,
-                                      208, 14, 94, 24);
+        /* ============ Inline layout ============ */
+        lv_color_t lbl_col = lv_color_hex(0x8B9AAE);
 
-        label(root_, "URL", 18, 44, 54, 18, lv_color_hex(0x7F8D9D));
-        url_ta_ = textarea(root_, kServerUrlPlaceholder, 78, 40, 224, 24, false);
-        rule(root_, 78, 64, 224, lv_color_hex(0x263341));
+        /* URL. */
+        int r1y = 52, r1h = 20;
+        label(card, "URL", 12, r1y + 3, 32, r1h, lbl_col);
+        url_ta_ = textarea(card, "http://192.168.x.x:8096", 44, r1y, 258, r1h, false);
 
-        label(root_, t(TextKey::Account), 18, 76, 54, 18, lv_color_hex(0x7F8D9D));
-        user_ta_ = textarea(root_, "username", 78, 72, 224, 24, false);
-        rule(root_, 78, 96, 224, lv_color_hex(0x263341));
+        /* User + Password. */
+        int r2y = 76, r2h = 20;
+        label(card, t(TextKey::Account), 12, r2y + 3, 36, r2h, lbl_col);
+        user_ta_ = textarea(card, "username", 48, r2y, 115, r2h, false);
+        label(card, t(TextKey::Password), 170, r2y + 3, 36, r2h, lbl_col);
+        pass_ta_ = textarea(card, "password", 206, r2y, 96, r2h, true);
 
-        label(root_, t(TextKey::Password), 18, 108, 54, 18, lv_color_hex(0x7F8D9D));
-        pass_ta_ = textarea(root_, "password", 78, 104, 224, 24, true);
-        rule(root_, 78, 128, 224, lv_color_hex(0x263341));
+        /* Buttons. */
+        int r3y = 100, r3h = 22;
+        login_btn_ = text_button(card, t(TextKey::Login), 12, r3y, 132, r3h, lv_color_hex(0xFFFFFF));
+        scan_btn_ = text_button(card, t(TextKey::ScanLan), 170, r3y + 1, 132, r3h - 2, lv_color_hex(0x556677));
 
-        login_btn_ = text_button(root_, t(TextKey::Login), 18, 142, 80, 22, lv_color_hex(0xFFFFFF));
-        status_ = label(root_, "", 106, 145, 196, 18, lv_color_hex(0xFF9B9B));
+        /* Status bar. */
+        status_ = label(card, "", 12, 127, 290, 14, lv_color_hex(0xFF9B9B), ui_font_14());
+        lv_obj_add_flag(status_, LV_OBJ_FLAG_HIDDEN);
+
         if (!config_.base_url.empty()) lv_textarea_set_text(url_ta_, config_.base_url.c_str());
         if (!config_.username.empty()) lv_textarea_set_text(user_ta_, config_.username.c_str());
         if (!config_.password.empty()) lv_textarea_set_text(pass_ta_, config_.password.c_str());
@@ -3338,7 +5106,8 @@ private:
         lv_anim_start(&anim);
 
         label(root_, current_language() == UiLanguage::Chinese ? "正在准备小屏控制和 HDMI 输出"
-                                                               : "Preparing small-screen controls and HDMI output",
+                                                               : (current_language() == UiLanguage::Japanese ? "小画面制御と HDMI 出力を準備中"
+                                                                                                              : "Preparing small-screen controls and HDMI output"),
               10, 112, 300, 18, lv_color_hex(0x7E8A99));
         lv_timer_handler();
     }
@@ -3403,9 +5172,157 @@ private:
 
     void toggle_language()
     {
-        config_.language = current_language() == UiLanguage::Chinese ? "en" : "zh-CN";
+        UiLanguage lang = current_language();
+        if (lang == UiLanguage::English) config_.language = "zh-CN";
+        else if (lang == UiLanguage::Chinese) config_.language = "ja-JP";
+        else config_.language = "en";
         save_config(config_);
         show_setup();
+    }
+
+    void start_lan_scan()
+    {
+        app_log("LAN scan start");
+        view_ = View::Loading;
+        clear();
+        label(root_, t(TextKey::ScanLan), 10, 18, 160, 18, accent_color(config_.type), ui_font_16());
+        label(root_, t(TextKey::ScanningLan), 10, 50, 300, 22, lv_color_hex(0xFFFFFF));
+        lv_obj_t *track = lv_obj_create(root_);
+        lv_obj_remove_style_all(track);
+        lv_obj_set_pos(track, 22, 88);
+        lv_obj_set_size(track, 276, 6);
+        lv_obj_clear_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(track, 3, 0);
+        lv_obj_set_style_bg_color(track, lv_color_hex(0x17212C), 0);
+        lv_obj_set_style_bg_opa(track, LV_OPA_COVER, 0);
+        lv_obj_t *pulse = lv_obj_create(track);
+        lv_obj_remove_style_all(pulse);
+        lv_obj_set_pos(pulse, 0, 0);
+        lv_obj_set_size(pulse, 56, 6);
+        lv_obj_set_style_radius(pulse, 3, 0);
+        lv_obj_set_style_bg_color(pulse, accent_color(config_.type), 0);
+        lv_obj_set_style_bg_opa(pulse, LV_OPA_COVER, 0);
+        lv_anim_t anim;
+        lv_anim_init(&anim);
+        lv_anim_set_var(&anim, pulse);
+        lv_anim_set_values(&anim, 0, 220);
+        lv_anim_set_exec_cb(&anim, anim_set_x);
+        lv_anim_set_path_cb(&anim, lv_anim_path_ease_in_out);
+        lv_anim_set_time(&anim, 1150);
+        lv_anim_set_playback_time(&anim, 1150);
+        lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_start(&anim);
+        lv_timer_handler();
+
+        lan_servers_ = lan_scan_servers();
+        {
+            std::string server_summary;
+            for (size_t i = 0; i < lan_servers_.size() && i < 5; ++i) {
+                if (i > 0) server_summary += ", ";
+                server_summary += lan_server_label(lan_servers_[i]) + "=" + lan_servers_[i].address;
+            }
+            if (lan_servers_.size() > 5) server_summary += "...";
+            app_log("LAN scan complete servers=" + std::to_string(lan_servers_.size()) +
+                    " [" + server_summary + "]");
+        }
+        lan_hosts_selected_ = 0;
+        if (lan_servers_.empty()) {
+            show_setup();
+            set_status(t(TextKey::NoLanServers));
+            return;
+        }
+        if (lan_servers_.size() == 1) {
+            apply_lan_server(lan_servers_[0]);
+            return;
+        }
+        render_lan_hosts();
+    }
+
+    void apply_lan_server(const LanServer &server)
+    {
+        if (server.type != LanServerType::Unknown) {
+            config_.type = server.type == LanServerType::Emby ? ServerType::Emby : ServerType::Jellyfin;
+        }
+        config_.base_url = server.address;
+        save_config(config_);
+        show_setup();
+        set_status(std::string(t(TextKey::FoundLanServers)) + ": " + lan_server_label(server));
+    }
+
+    void render_lan_hosts()
+    {
+        view_ = View::LanHosts;
+        clear(lv_color_hex(0x04070B));
+        lv_obj_t *card = lv_obj_create(root_);
+        lv_obj_set_pos(card, 3, 2);
+        lv_obj_set_size(card, 314, 166);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(card, 10, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x080D14), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x172431), 0);
+        lv_obj_set_style_shadow_width(card, 12, 0);
+        lv_obj_set_style_shadow_color(card, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_shadow_opa(card, 110, 0);
+        lv_obj_set_style_pad_all(card, 0, 0);
+
+        /* Card header. */
+        lv_obj_t *header = lv_obj_create(card);
+        lv_obj_set_pos(header, 0, 0);
+        lv_obj_set_size(header, 314, 30);
+        lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_radius(header, 10, 0);
+        lv_obj_set_style_bg_color(header, lv_color_hex(0x0B111A), 0);
+        lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(header, 0, 0);
+        lv_obj_set_style_pad_all(header, 0, 0);
+        label(header, t(TextKey::LanServersTitle), 12, 6, 170, 18, accent_color(config_.type), ui_font_16());
+        label(header, (std::to_string(lan_servers_.size()) + " found").c_str(), 200, 7, 104, 16, lv_color_hex(0x5A6A7C));
+
+        rule(card, 12, 34, 290, lv_color_hex(0x141F2B));
+        const size_t visible = std::min<size_t>(lan_servers_.size(), 4);
+        const int row_h = 26;
+        const int row_gap = 4;
+        int y = 44;
+        for (size_t i = 0; i < visible; ++i) {
+            const LanServer &server = lan_servers_[i];
+            bool selected = i == lan_hosts_selected_;
+            lv_obj_t *b = box(card, 12, y, 290, row_h,
+                              selected ? lv_color_hex(0x10202E) : lv_color_hex(0x0A1119),
+                              selected ? accent_color(config_.type) : lv_color_hex(0x1E2E42));
+            label(b, lan_server_label(server).c_str(), 10, 4, 176, 18,
+                  selected ? lv_color_hex(0xFFFFFF) : lv_color_hex(0xC4D2E0));
+            label(b, server.address.c_str(), 188, 4, 92, 18, lv_color_hex(0x7F8D9D));
+            y += row_h + row_gap;
+        }
+        label(card, t(TextKey::SelectLanServer), 12, 140, 290, 16, lv_color_hex(0xC4D2E0));
+        label(card, t(TextKey::LanScanHelp), 12, 154, 290, 16, lv_color_hex(0x5A6A7C));
+    }
+
+    void handle_lan_hosts_key(uint32_t key)
+    {
+        if (key == LV_KEY_ESC) {
+            show_setup();
+            return;
+        }
+        if (lan_servers_.empty()) {
+            show_setup();
+            return;
+        }
+        if (key == LV_KEY_UP || key == STREAMPLAYER_KEY_SUBTITLE) {
+            lan_hosts_selected_ = (lan_hosts_selected_ + lan_servers_.size() - 1) % lan_servers_.size();
+            render_lan_hosts();
+            return;
+        }
+        if (key == LV_KEY_DOWN || key == 'x' || key == 'X') {
+            lan_hosts_selected_ = (lan_hosts_selected_ + 1) % lan_servers_.size();
+            render_lan_hosts();
+            return;
+        }
+        if (key == LV_KEY_ENTER) {
+            apply_lan_server(lan_servers_[lan_hosts_selected_]);
+        }
     }
 
     void login_with_password(const std::string &password)
@@ -3509,7 +5426,10 @@ private:
         LibraryState &state = library_states_[library_index_];
         if (state.items.empty() && !state.exhausted) {
             if (!append_items_for_library(library_index_, true)) {
-                show_error(state.error.empty() ? "视频加载失败。" : state.error);
+                show_error(state.error.empty()
+                    ? (current_language() == UiLanguage::Japanese ? "動画の読み込みに失敗しました。"
+                       : (current_language() == UiLanguage::Chinese ? "视频加载失败。" : "Video load failed."))
+                    : state.error);
                 return false;
             }
         }
@@ -3548,7 +5468,7 @@ private:
             return true;
         }
         if (search_exhausted_) return true;
-        if (show_loader) show_loading("搜索中...");
+        if (show_loader) show_loading(current_language() == UiLanguage::Japanese ? "検索中..." : "搜索中...");
 
         std::vector<MediaItem> batch;
         std::string error;
@@ -3856,58 +5776,48 @@ private:
     std::string cached_image_path(const MediaItem &item, const std::string &kind, int width, int height)
     {
         if (!client_ || item.id.empty() || kind.empty() || item.id.find("demo-") == 0) return "";
-        mkdir("cache", 0700);
-        std::string dir = "cache/posters";
-        mkdir(dir.c_str(), 0700);
-        std::string path = dir + "/" + safe_file_id(item.id) + "-v3-" + safe_file_id(kind) + "-" +
+        std::string dir;
+        if (!ensure_poster_cache_dir(dir)) return "";
+        std::string path = dir + "/" + safe_file_id(item.id) + "-v5-" + safe_file_id(kind) + "-" +
                            std::to_string(width) + "x" + std::to_string(height) + ".png";
-        struct stat st {};
-        if (stat(path.c_str(), &st) == 0 && st.st_size > 0) return path;
+        if (file_nonempty(path)) {
+            if (file_has_png_signature(path) || convert_image_to_png(path)) return path;
+            unlink(path.c_str());
+        }
 
         std::string url = client_->image_url(item, kind, width, height);
-        if (url.empty()) return "";
-        std::string tmp = path + ".tmp";
-        std::string cmd = "curl -fsSL --connect-timeout 3 --max-time 8 -o " +
-                          shell_quote(tmp) + " " + shell_quote(url) + " >/dev/null 2>&1";
-        if (system(cmd.c_str()) != 0) {
-            unlink(tmp.c_str());
+        if (url.empty()) {
+            app_log("poster url empty item=" + item.id + " kind=" + kind);
             return "";
         }
-        struct stat tmp_st {};
-        if (stat(tmp.c_str(), &tmp_st) != 0 || tmp_st.st_size <= 0) {
-            unlink(tmp.c_str());
+        if (!download_cached_image(url, path, "item=" + item.id + " kind=" + kind +
+                                  " size=" + std::to_string(width) + "x" + std::to_string(height))) {
             return "";
         }
-        rename(tmp.c_str(), path.c_str());
         return path;
     }
 
     std::string cached_image_fit_path(const MediaItem &item, const std::string &kind, int width, int height)
     {
         if (!client_ || item.id.empty() || kind.empty() || item.id.find("demo-") == 0) return "";
-        mkdir("cache", 0700);
-        std::string dir = "cache/posters";
-        mkdir(dir.c_str(), 0700);
-        std::string path = dir + "/" + safe_file_id(item.id) + "-v4fit-" + safe_file_id(kind) + "-" +
+        std::string dir;
+        if (!ensure_poster_cache_dir(dir)) return "";
+        std::string path = dir + "/" + safe_file_id(item.id) + "-v5fit-" + safe_file_id(kind) + "-" +
                            std::to_string(width) + "x" + std::to_string(height) + ".png";
-        struct stat st {};
-        if (stat(path.c_str(), &st) == 0 && st.st_size > 0) return path;
+        if (file_nonempty(path)) {
+            if (file_has_png_signature(path) || convert_image_to_png(path)) return path;
+            unlink(path.c_str());
+        }
 
         std::string url = client_->image_fit_url(item, kind, width, height);
-        if (url.empty()) return "";
-        std::string tmp = path + ".tmp";
-        std::string cmd = "curl -fsSL --connect-timeout 3 --max-time 8 -o " +
-                          shell_quote(tmp) + " " + shell_quote(url) + " >/dev/null 2>&1";
-        if (system(cmd.c_str()) != 0) {
-            unlink(tmp.c_str());
+        if (url.empty()) {
+            app_log("poster fit url empty item=" + item.id + " kind=" + kind);
             return "";
         }
-        struct stat tmp_st {};
-        if (stat(tmp.c_str(), &tmp_st) != 0 || tmp_st.st_size <= 0) {
-            unlink(tmp.c_str());
+        if (!download_cached_image(url, path, "fit item=" + item.id + " kind=" + kind +
+                                  " size=" + std::to_string(width) + "x" + std::to_string(height))) {
             return "";
         }
-        rename(tmp.c_str(), path.c_str());
         return path;
     }
 
@@ -3921,22 +5831,30 @@ private:
                                           int width,
                                           int height)
     {
-        if (!item_image_kind_is_usable(item, kind)) return "";
         std::string path = cached_image_fit_path(item, kind, width, height);
         if (path.empty()) return "";
         if (should_keep_card_image(item, kind, path)) return path;
-        unlink(path.c_str());
         return "";
     }
 
     std::string cached_episode_still_path(const MediaItem &item, int width, int height)
     {
-        std::string path = cached_landscape_fit_path(item, "Primary", width, height);
+        std::string fallback;
+        const char *kinds[] = {"Primary", "Thumb", "Backdrop"};
+        for (const char *kind : kinds) {
+            std::string path = cached_image_path(item, kind, width, height);
+            if (path.empty()) continue;
+            if (looks_landscape_file(path)) return path;
+            if (fallback.empty() && file_nonempty(path)) fallback = path;
+        }
+
+        std::string path = cached_landscape_fit_path(item, "Thumb", width, height);
         if (!path.empty()) return path;
         path = cached_landscape_fit_path(item, "Backdrop", width, height);
         if (!path.empty()) return path;
-        path = cached_landscape_fit_path(item, "Thumb", width, height);
-        return path;
+        path = cached_landscape_fit_path(item, "Primary", width, height);
+        if (!path.empty()) return path;
+        return fallback;
     }
 
     std::string cached_landscape_background_path(const MediaItem &item)
@@ -3945,17 +5863,17 @@ private:
             std::string path = cached_episode_still_path(item, kScreenW, kScreenH);
             if (!path.empty()) return path;
 
-            if (is_episode_item(item) && !item.series_id.empty()) {
+            if (!item.series_id.empty()) {
                 MediaItem series;
                 series.id = item.series_id;
                 series.name = item.series_name;
                 series.type = "Series";
                 path = cached_image_fit_path(series, "Backdrop", kScreenW, kScreenH);
                 if (!path.empty() && looks_landscape_file(path)) return path;
-                if (!path.empty()) unlink(path.c_str());
+                if (!path.empty() && file_nonempty(path)) return path;
                 path = cached_image_fit_path(series, "Thumb", kScreenW, kScreenH);
                 if (!path.empty() && looks_landscape_file(path)) return path;
-                if (!path.empty()) unlink(path.c_str());
+                if (!path.empty() && file_nonempty(path)) return path;
             }
             return "";
         }
@@ -3965,7 +5883,7 @@ private:
         path = cached_image_fit_path(item, "Backdrop", kScreenW, kScreenH);
         if (!path.empty()) return path;
 
-        if (is_episode_item(item) && !item.series_id.empty()) {
+        if (item_prefers_still_art(item) && !item.series_id.empty()) {
             MediaItem series;
             series.id = item.series_id;
             series.name = item.series_name;
@@ -3984,7 +5902,7 @@ private:
         if (!path.empty()) return path;
         path = cached_image_fit_path(item, "Primary", kScreenW, kScreenH);
         if (!path.empty()) return path;
-        if (is_episode_item(item) && !item.series_id.empty()) {
+        if (item_prefers_still_art(item) && !item.series_id.empty()) {
             MediaItem series;
             series.id = item.series_id;
             series.name = item.series_name;
@@ -4006,7 +5924,7 @@ private:
         path = cached_image_fit_path(item, "Primary", poster_w, poster_h);
         if (!path.empty()) return path;
 
-        if (is_episode_item(item) && !item.series_id.empty()) {
+        if (item_prefers_still_art(item) && !item.series_id.empty()) {
             MediaItem series;
             series.id = item.series_id;
             series.name = item.series_name;
@@ -4074,8 +5992,13 @@ private:
     {
         std::string poster;
         if (item_prefers_still_art(item)) poster = cached_episode_still_path(item, w, h);
-        if (poster.empty()) {
-            poster = item_prefers_still_art(item) ? "" : cached_poster_path(item, w, h);
+        if (poster.empty()) poster = cached_poster_path(item, w, h);
+        if (poster.empty() && item_prefers_still_art(item) && !item.series_id.empty()) {
+            MediaItem series;
+            series.id = item.series_id;
+            series.name = item.series_name;
+            series.type = "Series";
+            poster = cached_poster_path(series, w, h);
         }
         if (!poster.empty()) {
             lv_obj_t *img = lv_image_create(card);
@@ -4083,7 +6006,7 @@ private:
             lv_obj_set_size(img, w, h);
             std::string src = lvgl_file_path(poster);
             lv_image_set_src(img, src.c_str());
-            lv_image_set_inner_align(img, item_prefers_still_art(item) ? LV_IMAGE_ALIGN_CONTAIN : LV_IMAGE_ALIGN_COVER);
+            lv_image_set_inner_align(img, LV_IMAGE_ALIGN_COVER);
         } else {
             const char *placeholder = is_audio_item(item) ? "封面" : (is_photo_item(item) ? "图片" : (item_prefers_still_art(item) ? "剧照" : "海报"));
             label(card, placeholder, x, y + h / 2 - 8, w, 16, lv_color_hex(0x586879));
@@ -4092,20 +6015,28 @@ private:
 
     void card_art_size(const MediaItem &item, int card_w, int card_h, int &art_w, int &art_h)
     {
-        if (is_episode_item(item)) {
+        if (item_prefers_still_art(item)) {
             fit_art_box(item, card_w - 4, card_h - 40, art_w, art_h);
         } else if (is_audio_item(item) || is_photo_item(item)) {
             art_w = std::min(card_w - 8, card_h > 136 ? 72 : 62);
             art_h = art_w;
         } else {
+            int ratio_w = 2;
+            int ratio_h = 3;
+            poster_ratio_for_item(item, ratio_w, ratio_h);
             art_w = std::min(card_w - 8, card_h > 136 ? 64 : 56);
-            art_h = art_w * 3 / 2;
+            art_h = std::max(1, static_cast<int>(static_cast<long long>(art_w) * ratio_h / ratio_w));
         }
         if (art_h > card_h - 38) {
             art_h = card_h - 38;
-            if (is_episode_item(item)) fit_art_box(item, card_w - 4, art_h, art_w, art_h);
+            if (item_prefers_still_art(item)) fit_art_box(item, card_w - 4, art_h, art_w, art_h);
             else if (is_audio_item(item) || is_photo_item(item)) art_w = art_h;
-            else art_w = art_h * 2 / 3;
+            else {
+                int ratio_w = 2;
+                int ratio_h = 3;
+                poster_ratio_for_item(item, ratio_w, ratio_h);
+                art_w = std::max(1, static_cast<int>(static_cast<long long>(art_h) * ratio_w / ratio_h));
+            }
         }
         art_w = std::max(24, std::min(art_w, card_w));
         art_h = std::max(24, std::min(art_h, card_h));
@@ -4162,8 +6093,8 @@ private:
         const int text_h = title_h + (show_meta ? 18 : 0);
         const int max_art_h = std::max(24, h - 5 - text_h);
         if (poster_h > max_art_h) {
-            if (is_episode_item(item)) {
-                fit_art_box(item, w - 4, max_art_h, poster_w, poster_h);
+                if (item_prefers_still_art(item)) {
+                    fit_art_box(item, w - 4, max_art_h, poster_w, poster_h);
             } else {
                 poster_h = max_art_h;
                 if (is_audio_item(item) || is_photo_item(item)) poster_w = poster_h;
@@ -4292,7 +6223,8 @@ private:
             label(root_, config_.base_url.c_str(), right_x, 68, right_w, 18, lv_color_hex(0xB7C4D2));
             label(root_, config_.username.c_str(), right_x, 90, right_w, 18, lv_color_hex(0xB7C4D2));
             label(root_, current_language() == UiLanguage::Chinese ? "Enter 打开设置 / 退出登录"
-                                                                   : "Enter for settings / log out",
+                                                                   : (current_language() == UiLanguage::Japanese ? "Enter 設定 / ログアウト"
+                                                                                                                  : "Enter for settings / log out"),
                   right_x, 132, right_w, 18, lv_color_hex(0x9BA8B6));
             return;
         }
@@ -4311,7 +6243,7 @@ private:
         }
 
         const bool episode_cards = focused_state->selected < focused_state->items.size() &&
-                                   is_episode_item(focused_state->items[focused_state->selected]);
+                                   item_prefers_still_art(focused_state->items[focused_state->selected]);
         const int visible_count = episode_cards ? 2 : 3;
         const int gap = 8;
         const int card_w = (right_w - gap * (visible_count - 1)) / visible_count;
@@ -4332,31 +6264,42 @@ private:
         add_to_group(root_);
         lv_group_focus_obj(root_);
 
-        label(root_, "搜索", 6, 5, 40, 18, accent_color(config_.type), ui_font_16());
-        std::string query = search_query_.empty() ? "输入关键词" : search_query_ + (search_dirty_ ? "_" : "");
+        label(root_, current_language() == UiLanguage::Japanese ? "検索" :
+                     (current_language() == UiLanguage::Chinese ? "搜索" : "Search"),
+              6, 5, 64, 18, accent_color(config_.type), ui_font_16());
+        std::string query = search_query_.empty()
+            ? (current_language() == UiLanguage::Japanese ? "キーワード入力" :
+               (current_language() == UiLanguage::Chinese ? "输入关键词" : "Enter keywords"))
+            : search_query_ + (search_dirty_ ? "_" : "");
         label(root_, query.c_str(), 48, 6, 264, 18,
               search_query_.empty() ? lv_color_hex(0x778596) : lv_color_hex(0xFFFFFF));
 
         if (!search_error_.empty()) {
             label(root_, search_error_.c_str(), 8, 54, 304, 22, lv_color_hex(0xFF9B9B));
-            label(root_, "Esc 返回", 8, 146, 304, 16, lv_color_hex(0x9BA8B6));
+            label(root_, current_language() == UiLanguage::Japanese ? "Esc 戻る" : "Esc 返回", 8, 146, 304, 16, lv_color_hex(0x9BA8B6));
             return;
         }
 
         if (trim(search_query_).empty()) {
-            label(root_, "输入后按 Enter 搜索", 8, 66, 304, 20, lv_color_hex(0xFFFFFF));
-            label(root_, "Esc 返回", 8, 146, 304, 16, lv_color_hex(0x9BA8B6));
+            label(root_, current_language() == UiLanguage::Japanese ? "Enter で検索" :
+                         (current_language() == UiLanguage::Chinese ? "输入后按 Enter 搜索" : "Enter to search"),
+                  8, 66, 304, 20, lv_color_hex(0xFFFFFF));
+            label(root_, current_language() == UiLanguage::Japanese ? "Esc 戻る" : "Esc 返回", 8, 146, 304, 16, lv_color_hex(0x9BA8B6));
             return;
         }
 
         if (search_results_.empty()) {
-            label(root_, search_dirty_ ? "Enter 搜索" : "没有结果", 8, 66, 304, 20, lv_color_hex(0xFFFFFF));
-            label(root_, "Esc 返回", 8, 146, 304, 16, lv_color_hex(0x9BA8B6));
+            label(root_, search_dirty_
+                      ? (current_language() == UiLanguage::Japanese ? "Enter 検索" : "Enter 搜索")
+                      : (current_language() == UiLanguage::Japanese ? "結果なし" :
+                         (current_language() == UiLanguage::Chinese ? "没有结果" : "No results")),
+                  8, 66, 304, 20, lv_color_hex(0xFFFFFF));
+            label(root_, current_language() == UiLanguage::Japanese ? "Esc 戻る" : "Esc 返回", 8, 146, 304, 16, lv_color_hex(0x9BA8B6));
             return;
         }
 
         const bool episode_cards = search_selected_ < search_results_.size() &&
-                                   is_episode_item(search_results_[search_selected_]);
+                                   item_prefers_still_art(search_results_[search_selected_]);
         const int visible_count = episode_cards ? 2 : 3;
         const int gap = 8;
         const int card_w = (308 - gap * (visible_count - 1)) / visible_count;
@@ -4406,7 +6349,12 @@ private:
             label(root_, crumb.c_str(), 6, 4, 308, 20, accent_color(config_.type));
         }
         std::string primary_meta = ticks_to_time(item->runtime_ticks);
-        if (is_photo_item(*item)) primary_meta = item->container.empty() ? "图片" : item->container;
+        if (is_photo_item(*item)) {
+            primary_meta = item->container.empty()
+                ? (current_language() == UiLanguage::Japanese ? "画像" :
+                   (current_language() == UiLanguage::Chinese ? "图片" : "Photo"))
+                : item->container;
+        }
         else if (is_audio_item(*item) && !item->album_artist.empty()) {
             primary_meta = item->album_artist + "  " + primary_meta;
         }
@@ -4483,16 +6431,32 @@ private:
 
     std::string active_audio_caption() const
     {
-        if (stream_indices("Audio").empty()) return "无音轨信息";
+        if (stream_indices("Audio").empty()) {
+            if (current_language() == UiLanguage::Japanese) return "音声トラック情報なし";
+            if (current_language() == UiLanguage::Chinese) return "无音轨信息";
+            return "No audio track info";
+        }
         size_t index = selected_audio_stream_ == kNoStream ? first_stream_index("Audio") : selected_audio_stream_;
-        return stream_caption(index, "音轨");
+        const char *fallback = current_language() == UiLanguage::Japanese ? "音声トラック" :
+                               (current_language() == UiLanguage::Chinese ? "音轨" : "Audio");
+        return stream_caption(index, fallback);
     }
 
     std::string active_subtitle_caption() const
     {
-        if (stream_indices("Subtitle").empty()) return "无字幕";
-        if (selected_subtitle_stream_ == kNoStream) return "关闭";
-        return stream_caption(selected_subtitle_stream_, "字幕");
+        if (stream_indices("Subtitle").empty()) {
+            if (current_language() == UiLanguage::Japanese) return "字幕なし";
+            if (current_language() == UiLanguage::Chinese) return "无字幕";
+            return "No subtitles";
+        }
+        if (selected_subtitle_stream_ == kNoStream) {
+            if (current_language() == UiLanguage::Japanese) return "オフ";
+            if (current_language() == UiLanguage::Chinese) return "关闭";
+            return "Off";
+        }
+        const char *fallback = current_language() == UiLanguage::Japanese ? "字幕" :
+                               (current_language() == UiLanguage::Chinese ? "字幕" : "Subtitle");
+        return stream_caption(selected_subtitle_stream_, fallback);
     }
 
     void reset_player_stream_selection()
@@ -4503,11 +6467,15 @@ private:
 
     void begin_player_session()
     {
-        playback_started_at_ = std::time(nullptr);
+        playback_started_at_ = 0;
         playback_seek_seconds_ = 0;
         playback_paused_seconds_ = 0;
         playback_paused_ = false;
+        playback_pipeline_ready_ = false;
+        playback_buffering_ = false;
         playback_reported_started_ = false;
+        playback_buffering_started_ms_ = 0;
+        playback_stall_retries_ = 0;
         last_progress_report_at_ = 0;
         player_notice_.clear();
         player_notice_until_ = 0;
@@ -4516,8 +6484,8 @@ private:
 
     long long current_playback_seconds() const
     {
-        if (playback_started_at_ <= 0) return playback_paused_seconds_;
-        if (playback_paused_) return playback_paused_seconds_;
+        if (playback_started_at_ <= 0) return playback_seek_seconds_;
+        if (playback_paused_ || playback_buffering_) return playback_paused_seconds_;
         long long elapsed = playback_seek_seconds_ +
                             static_cast<long long>(std::time(nullptr) - playback_started_at_);
         if (elapsed < 0) elapsed = 0;
@@ -4580,50 +6548,103 @@ private:
         return seconds;
     }
 
-    std::string playback_url_for_position(long long seconds) const
+    int selected_server_stream_index(size_t selected) const
     {
-        std::string url = playback_.url;
+        if (selected == kNoStream || selected >= playback_.streams.size()) return -1;
+        return playback_.streams[selected].index;
+    }
+
+    static size_t stream_position_for_server_index(const PlaybackChoice &choice,
+                                                   const char *type,
+                                                   int server_index)
+    {
+        if (server_index < 0) return kNoStream;
+        for (size_t i = 0; i < choice.streams.size(); ++i) {
+            if (choice.streams[i].type == type && choice.streams[i].index == server_index) {
+                return i;
+            }
+        }
+        return kNoStream;
+    }
+
+    std::string playback_url_for_choice_position(const PlaybackChoice &choice,
+                                                 long long seconds,
+                                                 int audio_stream_index,
+                                                 int subtitle_stream_index) const
+    {
+        std::string url = choice.url;
         if (url.empty() || is_photo_item(current_item_)) return url;
         seconds = clamped_playback_position(seconds);
-        if (is_audio_item(current_item_)) {
-            return url;
-        }
+        if (is_audio_item(current_item_)) return url;
+
         url = set_query_param(url, "StartTimeTicks", std::to_string(seconds * 10000000LL));
-        if (selected_audio_stream_ != kNoStream && selected_audio_stream_ < playback_.streams.size()) {
-            int index = playback_.streams[selected_audio_stream_].index;
-            if (index >= 0) url = set_query_param(url, "AudioStreamIndex", std::to_string(index));
+        if (audio_stream_index >= 0) {
+            url = set_query_param(url, "AudioStreamIndex", std::to_string(audio_stream_index));
         }
-        if (selected_subtitle_stream_ != kNoStream && selected_subtitle_stream_ < playback_.streams.size()) {
-            int index = playback_.streams[selected_subtitle_stream_].index;
-            if (index >= 0) url = set_query_param(url, "SubtitleStreamIndex", std::to_string(index));
-        } else {
-            url = set_query_param(url, "SubtitleStreamIndex", "-1");
-        }
+        url = set_query_param(url, "SubtitleStreamIndex",
+                              subtitle_stream_index >= 0
+                                  ? std::to_string(subtitle_stream_index)
+                                  : "-1");
         return url;
+    }
+
+    std::string playback_url_for_position(long long seconds) const
+    {
+        return playback_url_for_choice_position(
+            playback_, seconds,
+            selected_server_stream_index(selected_audio_stream_),
+            selected_server_stream_index(selected_subtitle_stream_));
     }
 
     bool restart_video_playback_at(long long seconds, const std::string &notice)
     {
         if (is_audio_item(current_item_) || is_photo_item(current_item_)) return false;
         seconds = clamped_playback_position(seconds);
-        std::string url = playback_url_for_position(seconds);
+        const std::string remote_url = playback_url_for_position(seconds);
         std::string error;
-        if (url.empty() || !player_.start(url, config_.access_token, error, false, true,
-                                          audio_output_, 0, small_screen_playback_)) {
+        if (remote_url.empty()) {
+            set_player_notice("重新拉起播放失败", 4);
+            return false;
+        }
+
+        std::string url;
+        long long actual_seconds = seconds;
+        if (!prepare_hls_seek_playlist(remote_url, config_.access_token, seconds,
+                                       url, actual_seconds, error)) {
+            set_player_notice(error.empty() ? "快进失败，继续当前播放"
+                                            : ellipsize(error, 40),
+                              4);
+            app_log("Restart playback seek preparation failed item=" +
+                    current_item_.id +
+                    " requested_position=" + std::to_string(seconds) +
+                    " error=" + error);
+            return false;
+        }
+
+        const bool preserved_kms =
+            player_.preserve_kms_for_restart(small_screen_playback_);
+        if (!player_.start(url, config_.access_token, error, false, true,
+                           audio_output_, 0, small_screen_playback_)) {
+            player_.stop();
             set_player_notice(error.empty() ? "重新拉起播放失败" : ellipsize(error, 40), 4);
             app_log("Restart playback failed item=" + current_item_.id + " error=" + error);
             return false;
         }
-        app_log("Restart playback item=" + current_item_.id + " position=" +
-                std::to_string(seconds) +
+
+        app_log("Restart playback item=" + current_item_.id +
+                " requested_position=" + std::to_string(seconds) +
+                " actual_position=" + std::to_string(actual_seconds) +
                 " small_screen=" + bool_text(small_screen_playback_) +
-                " url=" + url);
-        playback_seek_seconds_ = seconds;
-        playback_started_at_ = std::time(nullptr);
-        playback_paused_seconds_ = 0;
+                " preserved_kms=" + bool_text(preserved_kms) +
+                " local_hls=1");
+        playback_seek_seconds_ = actual_seconds;
+        playback_started_at_ = 0;
+        playback_paused_seconds_ = actual_seconds;
         playback_paused_ = false;
+        playback_pipeline_ready_ = false;
+        playback_buffering_ = false;
+        playback_buffering_started_ms_ = 0;
         set_player_notice(notice, 4);
-        report_playback_progress(true);
         return true;
     }
 
@@ -4635,8 +6656,12 @@ private:
         std::string error;
         bool video_mode = !is_audio_item(current_item_) && !is_photo_item(current_item_);
         long long start_seconds = is_audio_item(current_item_) ? seconds : 0;
+        const bool preserved_kms =
+            video_mode &&
+            player_.preserve_kms_for_restart(small_screen_playback_);
         if (!player_.start(url, config_.access_token, error, false, video_mode, audio_output_,
                            start_seconds, video_mode && small_screen_playback_)) {
+            if (preserved_kms) player_.stop();
             set_player_notice(error.empty() ? "切换输出失败" : ellipsize(error, 40), 4);
             app_log("Audio output switch failed item=" + current_item_.id +
                     " output=" + audio_output_label(audio_output_) +
@@ -4650,9 +6675,12 @@ private:
             set_player_notice(std::string("音频输出 ") + audio_output_label(audio_output_) + " / 从头播放", 4);
         }
         playback_seek_seconds_ = effective_seconds;
-        playback_started_at_ = std::time(nullptr);
-        playback_paused_seconds_ = 0;
+        playback_started_at_ = 0;
+        playback_paused_seconds_ = effective_seconds;
         playback_paused_ = false;
+        playback_pipeline_ready_ = false;
+        playback_buffering_ = false;
+        playback_buffering_started_ms_ = 0;
         app_log("Audio output switched item=" + current_item_.id +
                 " output=" + audio_output_label(audio_output_) +
                 " small_screen=" + bool_text(small_screen_playback_) +
@@ -4660,7 +6688,6 @@ private:
                 " effective_position=" + std::to_string(effective_seconds) +
                 " local_seek=" + bool_text(start_seconds > 0 && player_.start_offset_supported()) +
                 " url=" + url);
-        if (!is_audio_item(current_item_)) report_playback_progress(true);
         return true;
     }
 
@@ -4700,11 +6727,29 @@ private:
         }
 
         long long seconds = clamped_playback_position(current_playback_seconds());
-        std::string url = playback_url_for_position(seconds);
+        const int audio_stream_index = selected_server_stream_index(selected_audio_stream_);
+        const int subtitle_stream_index = selected_server_stream_index(selected_subtitle_stream_);
         std::string error;
+        PlaybackChoice target_choice;
+        if (!client_->playback_info(current_item_, target_choice, error, small_screen_output)) {
+            set_player_notice(error.empty() ? "切换输出配置失败" : ellipsize(error, 40), 4);
+            app_log("Video output profile request failed item=" + current_item_.id +
+                    " target_small=" + bool_text(small_screen_output) +
+                    " error=" + error);
+            return false;
+        }
+        std::string url = playback_url_for_choice_position(
+            target_choice, seconds, audio_stream_index, subtitle_stream_index);
         AudioOutput target_audio = small_screen_output ? AudioOutput::Speaker : audio_output_;
-        if (url.empty() || !player_.start(url, config_.access_token, error, false, true,
-                                          target_audio, 0, small_screen_output)) {
+        if (url.empty()) {
+            set_player_notice("切换输出失败", 4);
+            return false;
+        }
+        const bool preserved_kms =
+            player_.preserve_kms_for_restart(small_screen_output);
+        if (!player_.start(url, config_.access_token, error, false, true,
+                           target_audio, 0, small_screen_output)) {
+            if (preserved_kms) player_.stop();
             set_player_notice(error.empty() ? "切换输出失败" : ellipsize(error, 40), 4);
             app_log("Video output switch failed item=" + current_item_.id +
                     " target_small=" + bool_text(small_screen_output) +
@@ -4712,18 +6757,38 @@ private:
             return false;
         }
 
+        playback_paused_seconds_ = seconds;
+        playback_paused_ = true;
+        playback_buffering_ = false;
+        report_playback_stopped();
+        target_choice.url = url;
+        playback_ = target_choice;
         small_screen_playback_ = small_screen_output;
         audio_output_ = target_audio;
+        selected_audio_stream_ = stream_position_for_server_index(
+            playback_, "Audio", audio_stream_index);
+        if (selected_audio_stream_ == kNoStream) {
+            selected_audio_stream_ = first_stream_index("Audio");
+        }
+        selected_subtitle_stream_ = stream_position_for_server_index(
+            playback_, "Subtitle", subtitle_stream_index);
         playback_seek_seconds_ = seconds;
-        playback_started_at_ = std::time(nullptr);
-        playback_paused_seconds_ = 0;
+        playback_started_at_ = 0;
+        playback_paused_seconds_ = seconds;
         playback_paused_ = false;
+        playback_pipeline_ready_ = false;
+        playback_buffering_ = false;
+        playback_buffering_started_ms_ = 0;
+        playback_reported_started_ = false;
+        playback_stall_retries_ = 0;
+        last_progress_report_at_ = 0;
         set_player_notice(notice, 4);
-        report_playback_progress(true);
         app_log("Video output switched item=" + current_item_.id +
                 " output=" + video_display_output_label() +
                 " position=" + std::to_string(seconds) +
                 " audio_output=" + audio_output_label(audio_output_) +
+                " profile=" + playback_.summary +
+                " session=" + playback_.play_session_id +
                 " url=" + url);
         return true;
     }
@@ -4761,18 +6826,127 @@ private:
         time_t now = std::time(nullptr);
         if (!player_notice_.empty() && now <= player_notice_until_) return player_notice_;
         if (playback_paused_) return "已暂停";
+        if (playback_buffering_) return "网络缓冲中...";
         if (is_photo_item(current_item_)) return "HDMI 图片输出";
         if (is_audio_item(current_item_)) return "音频播放中";
+        if (!playback_pipeline_ready_) return small_screen_playback_ ? "小屏启动中..." : "HDMI 启动中...";
         if (small_screen_playback_) return "小屏播放中";
-        if (playback_started_at_ > 0 && now - playback_started_at_ < 8) return "HDMI 启动中...";
         return "播放中";
     }
 
     void update_player_progress()
     {
         if (view_ != View::Player) return;
+        if (!is_photo_item(current_item_) && !player_.running()) {
+            app_log("Player process exited while in player view item=" + current_item_.id +
+                    " backend=" + player_.backend());
+            report_playback_stopped();
+            stop_player_timer();
+            small_screen_playback_ = false;
+            playback_paused_ = false;
+            show_error("播放进程已退出。");
+            return;
+        }
+
+        const bool pipeline_ready = player_.ready();
+        const bool buffering = player_.buffering();
+        const time_t now = std::time(nullptr);
+        const uint64_t monotonic_now = monotonic_ms();
+        if (!playback_paused_ && !playback_pipeline_ready_ && !pipeline_ready &&
+            player_.startup_elapsed_ms() >= kPlayerStartupTimeoutMs) {
+            const long long retry_position = current_playback_seconds();
+            if (playback_stall_retries_ < 1) {
+                playback_stall_retries_++;
+                playback_buffering_started_ms_ = 0;
+                app_log("Player startup timeout retry item=" + current_item_.id +
+                        " position=" + std::to_string(retry_position));
+                if (restart_video_playback_at(retry_position, "启动超时，正在重试...")) {
+                    return;
+                }
+            }
+            playback_paused_seconds_ = retry_position;
+            playback_paused_ = true;
+            player_.stop();
+            report_playback_stopped();
+            stop_player_timer();
+            small_screen_playback_ = false;
+            playback_pipeline_ready_ = false;
+            playback_buffering_ = false;
+            show_error("播放启动超时，已停止；请检查网络后重试。");
+            return;
+        }
+        if (!pipeline_ready && player_.hardware_decoder_failed()) {
+            app_log("Player hardware decoder verification failed item=" + current_item_.id +
+                    " backend=" + player_.backend());
+            playback_paused_seconds_ = current_playback_seconds();
+            playback_paused_ = true;
+            player_.stop();
+            report_playback_stopped();
+            stop_player_timer();
+            small_screen_playback_ = false;
+            playback_pipeline_ready_ = false;
+            playback_buffering_ = false;
+            show_error("H.264 硬件解码器未生效，播放已停止。");
+            return;
+        }
+        if (pipeline_ready && !playback_pipeline_ready_) {
+            playback_pipeline_ready_ = true;
+            playback_started_at_ = now;
+            playback_paused_seconds_ = playback_seek_seconds_;
+            playback_buffering_ = buffering;
+            playback_buffering_started_ms_ = buffering ? monotonic_now : 0;
+            app_log("Player pipeline ready item=" + current_item_.id +
+                    " backend=" + player_.backend() +
+                    " buffering=" + bool_text(buffering));
+            if (!playback_reported_started_) report_playback_started();
+            else if (!buffering) report_playback_progress(true);
+        }
+        if (playback_pipeline_ready_) {
+            if (buffering && !playback_buffering_) {
+                playback_paused_seconds_ = current_playback_seconds();
+                playback_buffering_ = true;
+                playback_buffering_started_ms_ = monotonic_now;
+                app_log("Player buffering started item=" + current_item_.id +
+                        " position=" + std::to_string(playback_paused_seconds_));
+            } else if (!buffering && playback_buffering_) {
+                playback_seek_seconds_ = playback_paused_seconds_;
+                playback_started_at_ = now;
+                playback_buffering_ = false;
+                playback_buffering_started_ms_ = 0;
+                app_log("Player buffering completed item=" + current_item_.id +
+                        " position=" + std::to_string(playback_seek_seconds_));
+            }
+            if (!playback_paused_ && playback_buffering_ &&
+                playback_buffering_started_ms_ > 0 &&
+                monotonic_now - playback_buffering_started_ms_ >= 20000) {
+                const long long retry_position = current_playback_seconds();
+                if (playback_stall_retries_ < 1) {
+                    playback_stall_retries_++;
+                    playback_buffering_started_ms_ = 0;
+                    app_log("Player buffering timeout retry item=" + current_item_.id +
+                            " position=" + std::to_string(retry_position));
+                    if (restart_video_playback_at(
+                            retry_position, "缓冲超时，正在重连...")) {
+                        return;
+                    }
+                }
+                playback_paused_seconds_ = retry_position;
+                playback_paused_ = true;
+                player_.stop();
+                report_playback_stopped();
+                stop_player_timer();
+                small_screen_playback_ = false;
+                playback_pipeline_ready_ = false;
+                playback_buffering_ = false;
+                show_error("网络持续缓冲，已停止；请检查 Wi-Fi 后重试。");
+                return;
+            }
+        }
+
         if (small_screen_playback_) {
-            report_playback_progress(false);
+            if (playback_pipeline_ready_ && !playback_buffering_) {
+                report_playback_progress(false);
+            }
             return;
         }
 
@@ -4808,13 +6982,15 @@ private:
                                       playback_paused_ ? lv_color_hex(0xAEB8C5) : accent_color(config_.type), 0);
         }
 
-        report_playback_progress(false);
+        if (playback_pipeline_ready_ && !playback_buffering_) {
+            report_playback_progress(false);
+        }
     }
 
     void start_player_timer()
     {
         if (player_timer_) lv_timer_delete(player_timer_);
-        player_timer_ = lv_timer_create(player_timer_cb, 500, this);
+        player_timer_ = lv_timer_create(player_timer_cb, 1000, this);
     }
 
     void render_track_row(int y, const char *name, const std::string &value,
@@ -4896,7 +7072,8 @@ private:
             label(root_, current_language() == UiLanguage::Chinese ? "Esc 停止/列表" : "Esc Stop/List",
                   104, 91, 128, 16, lv_color_hex(0xD3DEE9));
             label(root_, current_language() == UiLanguage::Chinese ? "HDMI 上显示图片，小屏保留控制"
-                                                                   : "Photo on HDMI; controls stay here",
+                                                                   : (current_language() == UiLanguage::Japanese ? "HDMI に画像表示、操作は小画面"
+                                                                                                                  : "Photo on HDMI; controls stay here"),
                   10, 118, 300, 16, lv_color_hex(0x8F9FAF));
         } else if (is_audio_item(current_item_)) {
             label(root_, current_language() == UiLanguage::Chinese ? "空格 暂停" : "Space Pause",
@@ -4908,12 +7085,14 @@ private:
             render_track_row(118, t(TextKey::Output), player_output_label(), "Tab", true);
             render_track_row(139, t(TextKey::Audio),
                              current_item_.album_artist.empty()
-                                 ? (current_language() == UiLanguage::Chinese ? "音乐播放" : "Music playback")
+                                 ? (current_language() == UiLanguage::Chinese ? "音乐播放"
+                                    : (current_language() == UiLanguage::Japanese ? "音楽再生" : "Music playback"))
                                  : current_item_.album_artist,
                              "Esc", false);
         } else {
             label(root_, current_language() == UiLanguage::Chinese ? "空格暂停  Z/C快进退  N下一集"
-                                                                   : "Space Pause  Z/C Seek  N Next",
+                                                                   : (current_language() == UiLanguage::Japanese ? "Space 一時停止  Z/C 早送り/巻戻し  N 次"
+                                                                                                                  : "Space Pause  Z/C Seek  N Next"),
                   10, 88, 300, 16, lv_color_hex(0xD3DEE9));
             render_track_row(106, t(TextKey::Output), player_output_label(), "Tab", true);
             render_track_row(127, t(TextKey::Audio), active_audio_caption(), "F", false);
@@ -4932,7 +7111,11 @@ private:
             if (s.type == "Audio") audio++;
             if (s.type == "Subtitle") subs++;
         }
-        return "音轨: " + std::to_string(audio) + "  字幕: " + std::to_string(subs);
+        const char *audio_label = current_language() == UiLanguage::Japanese ? "音声: " :
+                                  (current_language() == UiLanguage::Chinese ? "音轨: " : "Audio: ");
+        const char *subtitle_label = current_language() == UiLanguage::Japanese ? "  字幕: " :
+                                     (current_language() == UiLanguage::Chinese ? "  字幕: " : "  Sub: ");
+        return std::string(audio_label) + std::to_string(audio) + subtitle_label + std::to_string(subs);
     }
 
     void render_sort()
@@ -5129,6 +7312,14 @@ private:
     {
         lv_obj_t *focused = focused_obj();
 
+        if ((key == LV_KEY_ESC) &&
+            ((server_dropdown_ && lv_dropdown_is_open(server_dropdown_)) ||
+             (language_dropdown_ && lv_dropdown_is_open(language_dropdown_)))) {
+            if (server_dropdown_ && lv_dropdown_is_open(server_dropdown_)) lv_dropdown_close(server_dropdown_);
+            if (language_dropdown_ && lv_dropdown_is_open(language_dropdown_)) lv_dropdown_close(language_dropdown_);
+            return;
+        }
+
         if (key == LV_KEY_NEXT || key == LV_KEY_DOWN || key == '\t') {
             if (group_) lv_group_focus_next(group_);
             update_setup_focus_marker();
@@ -5149,11 +7340,15 @@ private:
         }
         if (key == LV_KEY_ENTER) {
             if (focused == server_dropdown_) {
-                toggle_server_type();
+                if (lv_dropdown_is_open(server_dropdown_)) return;
+                lv_dropdown_open(server_dropdown_);
             } else if (focused == language_dropdown_) {
-                toggle_language();
+                if (lv_dropdown_is_open(language_dropdown_)) return;
+                lv_dropdown_open(language_dropdown_);
             } else if (focused == login_btn_ || focused == pass_ta_) {
                 login_from_setup();
+            } else if (focused == scan_btn_) {
+                start_lan_scan();
             } else {
                 if (group_) lv_group_focus_next(group_);
                 update_setup_focus_marker();
@@ -5253,7 +7448,8 @@ private:
     {
         std::vector<size_t> tracks = stream_indices("Audio");
         if (tracks.empty()) {
-            set_player_notice("没有可切换音轨");
+            set_player_notice(current_language() == UiLanguage::Japanese ? "切替できる音声トラックがありません"
+                              : (current_language() == UiLanguage::Chinese ? "没有可切换音轨" : "No switchable audio track"));
             update_player_progress();
             return;
         }
@@ -5263,7 +7459,8 @@ private:
         else selected_audio_stream_ = *it;
 
         bool ok = player_.cycle_audio();
-        std::string notice = std::string("音轨 ") + active_audio_caption();
+        std::string notice = (current_language() == UiLanguage::Japanese ? "音声 " :
+                              (current_language() == UiLanguage::Chinese ? "音轨 " : "Audio ")) + active_audio_caption();
         if (!ok) restart_video_playback_at(current_playback_seconds(), notice);
         else {
             set_player_notice(notice);
@@ -5276,7 +7473,8 @@ private:
     {
         std::vector<size_t> tracks = stream_indices("Subtitle");
         if (tracks.empty()) {
-            set_player_notice("没有字幕轨");
+            set_player_notice(current_language() == UiLanguage::Japanese ? "字幕トラックがありません"
+                              : (current_language() == UiLanguage::Chinese ? "没有字幕轨" : "No subtitle track"));
             update_player_progress();
             return;
         }
@@ -5290,7 +7488,8 @@ private:
         }
 
         bool ok = player_.cycle_subtitle();
-        std::string notice = std::string("字幕 ") + active_subtitle_caption();
+        std::string notice = (current_language() == UiLanguage::Japanese ? "字幕 " :
+                              (current_language() == UiLanguage::Chinese ? "字幕 " : "Subtitle ")) + active_subtitle_caption();
         if (!ok) restart_video_playback_at(current_playback_seconds(), notice);
         else {
             set_player_notice(notice);
@@ -5332,6 +7531,12 @@ private:
                 } else {
                     playback_seek_seconds_ = playback_paused_seconds_;
                     playback_started_at_ = std::time(nullptr);
+                    if (!playback_pipeline_ready_) {
+                        player_.reset_startup_timeout_clock();
+                    }
+                    if (playback_buffering_) {
+                        playback_buffering_started_ms_ = monotonic_ms();
+                    }
                     set_player_notice("继续播放");
                 }
             } else {
@@ -5344,11 +7549,17 @@ private:
             int delta = key == LV_KEY_LEFT ? -10 : 30;
             if (player_.seek(delta)) {
                 adjust_playback_position(delta);
+                playback_stall_retries_ = 0;
+                last_progress_report_at_ = 0;
                 set_player_notice(delta < 0 ? "快退 10 秒" : "快进 30 秒");
                 report_playback_progress(true);
             } else if (!is_audio_item(current_item_) && !is_photo_item(current_item_)) {
                 long long next = clamped_playback_position(current_playback_seconds() + delta);
-                restart_video_playback_at(next, std::string("跳转到 ") + seconds_to_clock(next));
+                if (restart_video_playback_at(
+                        next, std::string("跳转到 ") + seconds_to_clock(next))) {
+                    playback_stall_retries_ = 0;
+                    last_progress_report_at_ = 0;
+                }
             } else {
                 set_player_notice("当前后端不支持精确快进");
             }
@@ -5462,8 +7673,15 @@ private:
             show_hdmi_required_prompt(item);
             return;
         }
-        report_playback_stopped();
+        if (!acquire_background_performance_mode()) {
+            show_error("后台内存优化未就绪，已阻止播放；请退出后重试。");
+            return;
+        }
+        playback_paused_seconds_ = current_playback_seconds();
+        playback_paused_ = true;
+        playback_buffering_ = false;
         player_.stop();
+        report_playback_stopped();
         current_item_ = item;
         small_screen_playback_ = small_screen_playback;
         if (small_screen_playback_) {
@@ -5513,7 +7731,6 @@ private:
                 " audio_output=" + audio_output_label(audio_output_) +
                 " small_screen=" + bool_text(small_screen_playback_) +
                 " url=" + playback_.url);
-        report_playback_started();
         render_player();
     }
 
@@ -5530,8 +7747,11 @@ private:
 
     void logout()
     {
-        report_playback_stopped();
+        playback_paused_seconds_ = current_playback_seconds();
+        playback_paused_ = true;
+        playback_buffering_ = false;
         player_.stop();
+        report_playback_stopped();
         clear_config(&config_);
         ServerConfig remembered = config_;
         remembered.access_token.clear();
@@ -5569,7 +7789,11 @@ private:
     long long playback_seek_seconds_ = 0;
     long long playback_paused_seconds_ = 0;
     bool playback_paused_ = false;
+    bool playback_pipeline_ready_ = false;
+    bool playback_buffering_ = false;
     bool playback_reported_started_ = false;
+    uint64_t playback_buffering_started_ms_ = 0;
+    int playback_stall_retries_ = 0;
     bool small_screen_playback_ = false;
     bool has_pending_small_screen_item_ = false;
     uint64_t small_screen_prompt_ready_at_ms_ = 0;
@@ -5582,6 +7806,9 @@ private:
     uint64_t esc_hold_started_ms_ = 0;
     uint64_t last_esc_key_ms_ = 0;
     bool esc_exit_armed_ = false;
+    bool shutting_down_ = false;
+    bool background_guard_requested_ = false;
+    bool display_guard_requested_ = false;
 
     lv_obj_t *root_ = nullptr;
     lv_group_t *group_ = nullptr;
@@ -5589,12 +7816,15 @@ private:
     lv_obj_t *language_dropdown_ = nullptr;
     lv_obj_t *login_btn_ = nullptr;
     lv_obj_t *logout_btn_ = nullptr;
+    lv_obj_t *scan_btn_ = nullptr;
     lv_obj_t *small_screen_btn_ = nullptr;
     lv_obj_t *url_ta_ = nullptr;
     lv_obj_t *user_ta_ = nullptr;
     lv_obj_t *pass_ta_ = nullptr;
     lv_obj_t *status_ = nullptr;
     lv_obj_t *setup_focus_marker_ = nullptr;
+    std::vector<LanServer> lan_servers_;
+    size_t lan_hosts_selected_ = 0;
     lv_timer_t *player_timer_ = nullptr;
     lv_obj_t *player_status_label_ = nullptr;
     lv_obj_t *player_time_label_ = nullptr;
@@ -5619,4 +7849,9 @@ extern "C" void media_controller_init(void)
 extern "C" void media_controller_attach_keyboard(lv_indev_t *preferred)
 {
     g_controller.attach_keyboard(preferred);
+}
+
+extern "C" void media_controller_shutdown(void)
+{
+    g_controller.shutdown();
 }

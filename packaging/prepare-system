@@ -1,0 +1,178 @@
+#!/bin/sh
+set -eu
+
+state_dir=${STREAMPLAYER_STATE_DIR:-/var/lib/streamplayer}
+boot_config=${STREAMPLAYER_BOOT_CONFIG:-/boot/firmware/config.txt}
+meminfo_file=${STREAMPLAYER_MEMINFO:-/proc/meminfo}
+runtime_dir=${STREAMPLAYER_RUNTIME_DIR:-/run}
+original_line_file="${state_dir}/cma-original-line"
+applied_line_file="${state_dir}/cma-applied-line"
+backup_file="${state_dir}/config.txt.before-streamplayer"
+
+mark_reboot_required()
+{
+    touch "${runtime_dir}/reboot-required"
+    touch "${runtime_dir}/reboot-required.pkgs"
+    if ! grep -Fqx streamplayer "${runtime_dir}/reboot-required.pkgs" 2>/dev/null; then
+        printf '%s\n' streamplayer >> "${runtime_dir}/reboot-required.pkgs"
+    fi
+}
+
+replace_exact_line()
+{
+    config_file=$1
+    old_file=$2
+    new_file=$3
+    if ! temporary_file=$(mktemp "${config_file}.streamplayer.XXXXXX"); then
+        return 1
+    fi
+    if ! cp -- "${config_file}" "${temporary_file}"; then
+        rm -f -- "${temporary_file}"
+        return 1
+    fi
+    config_mode=$(stat -c '%a' "${config_file}" 2>/dev/null ||
+                  stat -f '%Lp' "${config_file}" 2>/dev/null ||
+                  true)
+    if [ -n "${config_mode}" ]; then
+        chmod "${config_mode}" "${temporary_file}" 2>/dev/null || true
+    fi
+    if ! awk -v old_file="${old_file}" -v new_file="${new_file}" '
+        BEGIN {
+            if ((getline old_line < old_file) < 0) exit 2
+            if ((getline new_line < new_file) < 0) exit 2
+            replaced = 0
+        }
+        !replaced && $0 == old_line {
+            print new_line
+            replaced = 1
+            next
+        }
+        { print }
+        END {
+            if (!replaced) exit 3
+        }
+    ' "${config_file}" > "${temporary_file}"; then
+        rm -f -- "${temporary_file}"
+        return 1
+    fi
+    if ! mv -- "${temporary_file}" "${config_file}"; then
+        rm -f -- "${temporary_file}"
+        return 1
+    fi
+}
+
+apply_cma()
+{
+    [ -f "${boot_config}" ] || return 0
+
+    mem_total_kb=$(awk '$1 == "MemTotal:" { print $2; exit }' "${meminfo_file}")
+    cma_total_kb=$(awk '$1 == "CmaTotal:" { print $2; exit }' "${meminfo_file}")
+    mem_total_kb=${mem_total_kb:-0}
+    cma_total_kb=${cma_total_kb:-0}
+
+    # The 64 MiB reservation is specifically for low-memory CardputerZero
+    # boards. Do not rewrite boot configuration on larger generic systems.
+    [ "${mem_total_kb}" -gt 0 ] || return 0
+    [ "${mem_total_kb}" -lt 524288 ] || return 0
+    [ "${cma_total_kb}" -lt 49152 ] || return 0
+
+    current_line=$(sed -n '/^[[:space:]]*dtoverlay=vc4-kms-v3d\([,[:space:]].*\)\{0,1\}$/ { p; q; }' "${boot_config}")
+    if [ -z "${current_line}" ]; then
+        printf '%s\n' "streamplayer: vc4-kms-v3d overlay not found; CMA was not changed" >&2
+        return 0
+    fi
+
+    if printf '%s\n' "${current_line}" |
+       grep -Eq '(^|,)[[:space:]]*cma-64([[:space:]]*(,|$))'; then
+        mark_reboot_required
+        return 0
+    fi
+
+    mkdir -p "${state_dir}"
+    chmod 0700 "${state_dir}"
+
+    if [ -f "${applied_line_file}" ] && [ -f "${original_line_file}" ]; then
+        applied_line=$(sed -n '1p' "${applied_line_file}")
+        if [ "${current_line}" = "${applied_line}" ]; then
+            mark_reboot_required
+        else
+            printf '%s\n' "streamplayer: boot config changed after a prior install; leaving it untouched" >&2
+        fi
+        return 0
+    fi
+
+    if printf '%s\n' "${current_line}" | grep -Eq ',[[:space:]]*cma-[0-9]+'; then
+        new_line=$(printf '%s\n' "${current_line}" |
+                   sed -E 's/,[[:space:]]*cma-[0-9]+/,cma-64/g')
+    else
+        new_line="${current_line},cma-64"
+    fi
+
+    cp -- "${boot_config}" "${backup_file}"
+    printf '%s\n' "${current_line}" > "${original_line_file}"
+    printf '%s\n' "${new_line}" > "${applied_line_file}"
+    chmod 0600 "${backup_file}" "${original_line_file}" "${applied_line_file}"
+
+    replacement_file="${state_dir}/cma-replacement-line"
+    printf '%s\n' "${new_line}" > "${replacement_file}"
+    chmod 0600 "${replacement_file}"
+    if ! replace_exact_line "${boot_config}" "${original_line_file}" "${replacement_file}"; then
+        rm -f -- "${original_line_file}" "${applied_line_file}" "${replacement_file}"
+        printf '%s\n' "streamplayer: failed to update CMA boot setting" >&2
+        return 1
+    fi
+    rm -f -- "${replacement_file}"
+    mark_reboot_required
+    printf '%s\n' "streamplayer: reserved 64 MiB CMA; reboot required before hardware playback"
+}
+
+restore_cma()
+{
+    [ -f "${boot_config}" ] || return 0
+    [ -f "${original_line_file}" ] || return 0
+    [ -f "${applied_line_file}" ] || return 0
+
+    applied_line=$(sed -n '1p' "${applied_line_file}")
+    if ! grep -Fqx -- "${applied_line}" "${boot_config}"; then
+        printf '%s\n' "streamplayer: CMA line was changed by the user; not restoring boot config" >&2
+        : > "${state_dir}/restore-conflict"
+        return 0
+    fi
+
+    if replace_exact_line "${boot_config}" "${applied_line_file}" "${original_line_file}"; then
+        rm -f -- \
+            "${original_line_file}" \
+            "${applied_line_file}" \
+            "${state_dir}/restore-conflict" \
+            "${state_dir}/restore-failed"
+        mark_reboot_required
+        printf '%s\n' "streamplayer: restored the previous CMA setting; reboot required"
+    else
+        printf '%s\n' "streamplayer: failed to restore the previous CMA setting" >&2
+        : > "${state_dir}/restore-failed"
+        return 1
+    fi
+}
+
+case "${1:-apply}" in
+    apply)
+        apply_cma
+        ;;
+    restore)
+        restore_cma
+        ;;
+    status)
+        awk '$1 == "MemTotal:" || $1 == "CmaTotal:" || $1 == "CmaFree:" { print }' "${meminfo_file}"
+        if [ -f "${applied_line_file}" ]; then
+            printf '%s\n' "managed_cma=yes"
+        else
+            printf '%s\n' "managed_cma=no"
+        fi
+        ;;
+    *)
+        printf '%s\n' "usage: $0 [apply|restore|status]" >&2
+        exit 2
+        ;;
+esac
+
+exit 0

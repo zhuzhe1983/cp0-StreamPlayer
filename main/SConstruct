@@ -4,6 +4,11 @@ Import("env")
 with open(env["PROJECT_TOOL_S"]) as f:
     exec(f.read())
 
+if "CONFIG_TOOLCHAIN_PREFIX" in os.environ:
+    env["RANLIB"] = '${_concat(GCCPREFIX, "ranlib", GCCSUFFIX, __env__)}'
+    env["RANLIBCOM"] = "$RANLIB $TARGET"
+    env["ARFLAGS"] = ["rcs"]
+
 
 SRCS = Glob("src/*.c*")
 INCLUDE = [ADir("."), ADir("include")]

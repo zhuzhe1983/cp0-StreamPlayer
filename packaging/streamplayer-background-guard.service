@@ -1,0 +1,11 @@
+[Unit]
+Description=StreamPlayer low-memory PackageKit guard
+After=dbus.service
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/streamplayer/resource-guard background
+ExecStopPost=/usr/lib/streamplayer/resource-guard restore-background
+Restart=no
+OOMPolicy=stop
+TimeoutStopSec=150s

@@ -1,0 +1,12 @@
+Package: streamplayer
+Version: 0.1.0-m5stack16
+Architecture: arm64
+Maintainer: Zhu Zhe <zhuzhe1983@gmail.com>
+Section: APPLaunch
+Priority: optional
+Homepage: https://github.com/zhuzhe1983/cp0-StreamPlayer
+Depends: libc6 (>= 2.38), libgcc-s1, libstdc++6, libinput10, libxkbcommon0, libudev1, ca-certificates, curl, util-linux, systemd, sudo, iw, alsa-utils, wlr-randr, fonts-dejavu-core, gstreamer1.0-tools, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, gstreamer1.0-alsa
+Recommends: ffmpeg, mpv, pipewire-bin, wireplumber, bluez
+Description: Emby and Jellyfin media player for CardputerZero
+ StreamPlayer browses Emby and Jellyfin libraries and plays media through
+ CardputerZero's LCD, HDMI, speaker, headphone, or Bluetooth outputs.

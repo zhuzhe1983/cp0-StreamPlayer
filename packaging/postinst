@@ -1,0 +1,41 @@
+#!/bin/sh
+set -e
+
+if command -v visudo >/dev/null 2>&1; then
+    visudo -cf /etc/sudoers.d/streamplayer >/dev/null
+fi
+
+if [ -x /usr/lib/streamplayer/prepare-system ]; then
+    /usr/lib/streamplayer/prepare-system apply
+fi
+
+if [ -x /usr/lib/streamplayer/validate-runtime ] && id pi >/dev/null 2>&1; then
+    if ! runuser -u pi -- /usr/lib/streamplayer/validate-runtime; then
+        printf '%s\n' \
+            "streamplayer: runtime validation is incomplete; run validate-runtime after reboot" >&2
+    fi
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable streamplayer-tuning.service >/dev/null
+    systemctl restart streamplayer-tuning.service >/dev/null
+fi
+
+if id pi >/dev/null 2>&1; then
+    if [ -d /home/pi/.config/m5streamplayer ]; then
+        runuser -u pi -- chmod 0700 /home/pi/.config/m5streamplayer 2>/dev/null || true
+        runuser -u pi -- chmod 0600 \
+            /home/pi/.config/m5streamplayer/config.ini 2>/dev/null || true
+    fi
+    runuser -u pi -- chmod 0600 \
+        /tmp/m5streamplayer-app.log \
+        /tmp/m5streamplayer-player.log 2>/dev/null || true
+fi
+
+if [ -f /run/reboot-required.pkgs ] &&
+   grep -Fqx streamplayer /run/reboot-required.pkgs 2>/dev/null; then
+    printf '%s\n' "StreamPlayer hardware decoding setup requires one reboot."
+fi
+
+exit 0
