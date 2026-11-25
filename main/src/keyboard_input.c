@@ -10,6 +10,8 @@
 #include <locale.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
+#include <signal.h>
 #include "keyboard_input.h"
 #include "lvgl/lvgl.h"
 
@@ -470,11 +472,25 @@ void *keyboard_read_thread(void *argv) {
     printf("开始监听键盘输入 (%s)\n", device_path);
     libinput_dispatch(kc.li);
 
+    uint64_t escape_started_ms = 0;
+    bool escape_exit_sent = false;
     while (1) {
-        int pr = poll(pfds, 2, -1);
+        int pr = poll(pfds, 2, escape_started_ms ? 50 : -1);
         if (pr < 0) {
             if (errno == EINTR) continue;
             perror("poll"); break;
+        }
+
+        /* Track the physical hold outside LVGL so a busy UI or a device
+         * without key-repeat cannot lose long-Esc. SIGINT requests the
+         * application's existing clean shutdown on its main thread. */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t now_ms = (uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+        if (escape_started_ms && !escape_exit_sent &&
+            now_ms - escape_started_ms >= 900) {
+            escape_exit_sent = true;
+            kill(getpid(), SIGINT);
         }
 
         /* 键盘事件 */
@@ -488,6 +504,14 @@ void *keyboard_read_thread(void *argv) {
                     uint32_t code = libinput_event_keyboard_get_key(kev);
                     enum libinput_key_state ks =
                         libinput_event_keyboard_get_key_state(kev);
+                    if (code == KEY_ESC) {
+                        if (ks == LIBINPUT_KEY_STATE_PRESSED) {
+                            if (!escape_started_ms) escape_started_ms = now_ms;
+                        } else {
+                            escape_started_ms = 0;
+                            escape_exit_sent = false;
+                        }
+                    }
                     process_key(&kc, code,
                                 ks == LIBINPUT_KEY_STATE_PRESSED ? 1 : 0);
                 }

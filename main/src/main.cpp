@@ -164,8 +164,6 @@ static void keypad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
             data->continue_reading = !STAILQ_EMPTY(&keyboard_queue);
         }
 
-        printf("StreamPlayer key: code=%u state=%d sym=%s utf8=%s lv=%u\n",
-               key->key_code, key->key_state, key->sym_name, key->utf8, data->key);
         free(key);
     }
     pthread_mutex_unlock(&keyboard_mutex);

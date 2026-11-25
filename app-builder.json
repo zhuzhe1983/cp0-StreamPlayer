@@ -2,11 +2,11 @@
   "name": "StreamPlayer",
   "package": "streamplayer",
   "package_name": "streamplayer",
-  "version": "0.1.0-m5stack16",
+  "version": "0.1.0-m5stack17",
   "app_name": "StreamPlayer",
   "bin_name": "M5CardputerZero-StreamPlayer",
-  "description": "Emby and Jellyfin media player for the CardputerZero LCD and 1080p HDMI output. The Debian package bundles Noto Sans SC, installs DejaVu Sans fallback glyphs, and declares its required GStreamer, network, input, audio, and device-tuning dependencies.",
-  "maintainer": "Zhu Zhe <zhuzhe1983@gmail.com>",
+  "description": "Emby and Jellyfin music and LCD video player for CardputerZero (store edition).",
+  "maintainer": "Zhu Zhe <1917345+zhuzhe1983@users.noreply.github.com>",
   "homepage": "https://github.com/zhuzhe1983/cp0-StreamPlayer",
   "runtime": "legacy-deb-only",
   "lvgl_version": "9.5",
@@ -18,34 +18,37 @@
     "process"
   ],
   "store": {
-    "summary": "Emby and Jellyfin player for CardputerZero LCD and 1080p HDMI.",
-    "description": "StreamPlayer browses and plays Emby and Jellyfin libraries on the CardputerZero built-in LCD or 1080p HDMI, with speaker, headphone, and Bluetooth audio output. The Debian package bundles Noto Sans SC and installs fonts-dejavu-core, curl/CA certificates, input and device libraries, ALSA tools, wlr-randr, and the complete GStreamer playback stack through apt; ffmpeg, mpv, PipeWire/WirePlumber, and BlueZ are optional recommendations. For reliable V4L2 hardware decoding on low-memory units, installation may reserve 64 MiB CMA (one reboot is required) and disables Wi-Fi power saving. During StreamPlayer's entire foreground lifetime it pauses PackageKit and releases LightDM so the desktop does not compete for memory or HDMI KMS; APPLaunch and StreamPlayer keep using the independent built-in LCD framebuffer. Root-owned guards restore prior service state after normal exit, a crash, SIGKILL, or OOM. The diagnostic M5_STREAMPLAYER_KEEP_LIGHTDM=1 override skips the startup LightDM pause at the cost of available RAM. Package removal restores app-managed CMA and Wi-Fi settings only when the user has not changed them afterward.",
+    "summary": "Emby/Jellyfin music and LCD video player for CardputerZero.",
+    "description": "Browse Emby and Jellyfin media libraries, search titles, play music and watch server-transcoded 320x170 video on the CardputerZero LCD. Supports English, Simplified Chinese and Japanese, local speaker/headphone audio and optional already-configured Bluetooth audio. This reduced store edition runs as the launcher user and includes no root services, sudo configuration, boot/CMA or Wi-Fi changes, or PackageKit/LightDM control. HDMI video/photo output and automatic hardware-decoder setup are unavailable. LCD video uses software H.264 decoding; a server capable of transcoding to the LCD profile is required. Performance depends on the server, network and available RAM. Enter opens or plays, Space pauses, Z/C seek, short Esc returns and holding Esc exits. Configure your own Emby/Jellyfin server and account inside the app.",
     "categories": [
-      "Media",
-      "Video"
+      "Media"
     ],
+    "license": "MIT",
+    "author": {
+      "display_name": "Zhu Zhe",
+      "github": "zhuzhe1983"
+    },
+    "share_code": "STRP",
     "source_repo": "https://github.com/zhuzhe1983/cp0-StreamPlayer",
     "icon": "share/images/stream-player.png",
+    "screenshots": [
+      "store/screenshots/setup.png"
+    ],
+    "permissions": {
+      "camera": false,
+      "microphone": false,
+      "imu": false,
+      "network": true,
+      "additional_hardware": false,
+      "background_service": false,
+      "external_display": false
+    },
     "locales": {
       "zh-CN": {
         "title": "StreamPlayer",
-        "summary": "支持 CardputerZero 小屏和 1080p HDMI 的 Emby/Jellyfin 播放器。",
-        "description": "StreamPlayer 用于浏览和播放 Emby、Jellyfin 媒体库，支持 CardputerZero 内置小屏、1080p HDMI 以及扬声器、耳机和蓝牙音频。Debian 包随包安装 Noto Sans SC 字体，并通过 apt 安装 fonts-dejavu-core Unicode 后备字体、curl/CA 证书、输入与设备库、ALSA 工具、wlr-randr 及完整的 GStreamer 播放组件；ffmpeg、mpv、PipeWire/WirePlumber 和 BlueZ 为可选推荐项。为保证低内存设备上的 V4L2 硬件解码稳定，安装时可能把 CMA 调整为 64 MiB（需要重启一次），并关闭 Wi-Fi 省电。StreamPlayer 整个前台生命周期都会暂停 PackageKit 并释放 LightDM，避免桌面占用内存或争用 HDMI KMS；APPLaunch 与 StreamPlayer 继续使用独立的内置小屏 framebuffer。root 守护服务会在正常退出、崩溃、SIGKILL 或 OOM 后恢复原有服务状态。诊断用 M5_STREAMPLAYER_KEEP_LIGHTDM=1 可跳过启动时暂停 LightDM，但会减少可用内存。卸载时只会恢复仍由本应用管理、且之后未被用户改动的 CMA 与 Wi-Fi 设置。"
-      },
-      "en": {
-        "title": "StreamPlayer",
-        "summary": "Emby and Jellyfin player for CardputerZero LCD and 1080p HDMI.",
-        "description": "StreamPlayer browses and plays Emby and Jellyfin libraries on the CardputerZero built-in LCD or 1080p HDMI, with speaker, headphone, and Bluetooth audio output. The Debian package bundles Noto Sans SC and installs fonts-dejavu-core for Unicode fallback glyphs, plus curl/CA certificates, input and device libraries, ALSA tools, wlr-randr, and the complete GStreamer playback stack through apt; ffmpeg, mpv, PipeWire/WirePlumber, and BlueZ are optional recommendations. For reliable V4L2 hardware decoding on low-memory units, installation may reserve 64 MiB CMA (one reboot is required) and disables Wi-Fi power saving. During StreamPlayer's entire foreground lifetime it pauses PackageKit and releases LightDM so the desktop does not compete for memory or HDMI KMS; APPLaunch and StreamPlayer keep using the independent built-in LCD framebuffer. Root-owned guards restore prior service state after normal exit, a crash, SIGKILL, or OOM. The diagnostic M5_STREAMPLAYER_KEEP_LIGHTDM=1 override skips the startup LightDM pause at the cost of available RAM. Package removal restores app-managed CMA and Wi-Fi settings only when the user has not changed them afterward."
+        "summary": "面向 CardputerZero 的 Emby/Jellyfin 音乐与小屏视频播放器。",
+        "description": "浏览、搜索自己的 Emby/Jellyfin 媒体库，播放音乐及由服务器转码为 320×170 的视频，提供中、英、日界面。本商店精简版以前台普通用户运行；不安装 root 服务和 sudo 配置，不修改启动内存或 Wi-Fi，不控制 PackageKit 和 LightDM。移除了 HDMI 视频、图片输出和自动硬解配置，小屏视频使用 H.264 软件解码，需要媒体服务器支持相应转码。Enter 打开或播放，空格暂停，Z/C 快进退，短按 Esc 返回，长按 Esc 退出。"
       }
-    },
-    "permissions": {
-      "audio_output": true,
-      "network": true,
-      "filesystem": "full",
-      "keyboard_input": true,
-      "background_service": true,
-      "external_hardware": true,
-      "hdmi_output": true
     }
   }
 }

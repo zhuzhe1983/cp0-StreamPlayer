@@ -1,75 +1,42 @@
-# Application Store Publish Record
+# StreamPlayer store edition publication
 
-Keep this file in the application project root. Update it when package
-metadata, listing copy, assets, privacy choices, or submission status changes.
+User authorized publication and a separate reduced branch on 2026-11-25; the original uncommitted UI changes remain in the original working tree. Original application license: MIT, explicitly selected by the user.
 
-Portal: <https://dev.cardputer.cc/#/upload>
+## Store branch and package
 
-## Package
+- Branch: `store-compliant-20261125`; project: `StreamPlayer-store`.
+- Version: `0.1.0-m5stack17`, `arm64`.
+- Package: `artifacts/streamplayer_0.1.0-m5stack17_arm64.deb`; a copy and QA files are retained in `artifacts/publish-20261125/`.
+- SHA-256: `7ddcf0513aa64414dd026410aa461a7c6ca1748145b7513d5b93d991671d3c68`.
+- Executable SHA-256: `150ad8e9a778058d63164041d94294071ecf9c20ffce97ef427e772feef2baf4`.
+- Maintainer: `Zhu Zhe <1917345+zhuzhe1983@users.noreply.github.com>`; public source: <https://github.com/zhuzhe1983/cp0-StreamPlayer>, store branch listed above; hide email true.
+- Original source worktree has not been reset or overwritten. This branch starts at committed `03bccbb`; its separate unfinished numeric-key UI changes remain in the original worktree.
+- Build with `CardputerZero=1 scons`, then `./scripts/build_deb.sh --no-build`. Existing SDK/sysroot reused; no global SDK installation.
 
-- Debian package path: `artifacts/streamplayer_0.1.0-m5stack15_arm64.deb`
-- Package: `streamplayer`
-- Version: `0.1.0-m5stack15`
-- Architecture: `arm64`
-- Maintainer: `Zhu Zhe <zhuzhe1983@gmail.com>`
-- APPLaunch desktop path: `/usr/share/APPLaunch/applications/stream-player.desktop`
-- Executable path: `/usr/share/APPLaunch/bin/M5CardputerZero-StreamPlayer`
+## Reduced functionality
 
-## Source and Ownership
+- Keeps Emby/Jellyfin browsing, search, music and server-transcoded 320×170 LCD H.264 video.
+- No root systemd services, sudoers, NetworkManager dispatcher, boot/CMA or Wi-Fi tuning, PackageKit/LightDM control, HDMI mode changes or HDMI video/photo output are installed or requested.
+- LCD uses FFmpeg software H.264 decoding with one decoder thread. Music uses mpv. GStreamer is not a required dependency of this edition. Audio retains its natural rate; no time-stretch or speed adjustment is used.
+- Core LVGL and bundled-library notices, application MIT and Noto OFL notices are packaged. The bundled SC font is private to `/usr/share/streamplayer/fonts`; Japanese selects the system JP TTC face. Language switching deletes the old labels and reloads the font family before rebuilding the screen.
+- Current `app-builder.json` is the authoritative store copy. Category Media, author Zhu Zhe / zhuzhe1983, license MIT, share code STRP. Network true; all other six store permissions false.
+- Source icon: `share/images/stream-player.png`. Screenshot: `store/screenshots/setup.png` (clean actual-device 320×170 image; no private account or server data).
 
-- Public source repository: <https://github.com/zhuzhe1983/cp0-StreamPlayer>
-- Expected GitHub uploader/owner: `zhuzhe1983`
-- Hide uploader email: `true`
+## Validation and limitations
 
-## Listing
+- ARM64 cross-build and strict local package/listing checks passed. Current server install-path policy passed; no root services or privileged commands remain in runtime code. Dependencies installed through apt; installed files were backed up before each deployment.
+- Device: `192.168.199.179`, UID1000. Initial backup: `/home/pi/streamplayer-backups/20261125-231155`; subsequent development replacements have separate timestamped backups.
+- Physical-device test uses generated test-pattern video and a generated 440 Hz tone with the local protocol fixture `tests/store_fixture.py`. These checks do not establish compatibility with a production Emby/Jellyfin server, every transcode format, Bluetooth hardware, or perceived audio quality. Real-device user video remains required for store review.
+- GStreamer plugin discovery blocked during the first trial; this edition therefore uses FFmpeg for LCD playback. Actual later framebuffer capture showed the generated moving test pattern and the decoder ran as pi.
+- Final binary music, video, pause, return, language and long-Esc checks: in progress.
+- Official CLI metadata policy and final checksum verification: pending final run.
 
-- Application name: `StreamPlayer`
-- One-line summary (maximum 80 characters): `Emby and Jellyfin player for CardputerZero LCD and 1080p HDMI.`
-- Description: use the reviewed Chinese or English
-  `store.locales.<locale>.description` from `app-builder.json`. It explains the
-  required apt dependencies, bundled Noto Sans SC font, the
-  `fonts-dejavu-core` Unicode fallback, optional recommended packages,
-  64 MiB CMA/reboot behavior, Wi-Fi power-save tuning, and the temporary
-  PackageKit/LightDM guards and their restoration behavior.
-- Categories (maximum 6): `Media`, `Video`
-- AppBuilder capabilities: `keyboard`, `audio`, `network`, `filesystem`,
-  `process`
-- Store permissions: `audio_output=true`, `network=true`, `filesystem=full`,
-  `keyboard_input=true`, `background_service=true`,
-  `external_hardware=true`, `hdmi_output=true`
-- Full-filesystem rationale: package installation and removal can manage the
-  CardputerZero CMA boot setting under `/boot`, install narrowly scoped
-  service/sudo/NetworkManager files under `/etc` and `/usr`, keep reversible
-  state under `/var`, and use runtime guards under `/run`. The listing
-  description documents these adjustments and their restoration behavior.
+## Submission
 
-## Assets
+- User explicitly requested submission; no further publication permission is needed.
+- Publish PR: pending.
+- Status: preparing final validation; physical-device launch/use/exit video and maintainer review pending.
 
-- 256 x 256 source icon: `share/images/stream-player.png`
-- Icon packaged in `.deb`: `/usr/share/APPLaunch/share/images/stream-player.png`
-- Screenshot 1 (320 x 170): TODO
-- Screenshot 2 (320 x 170): TODO
-- Screenshot 3 (320 x 170): TODO
-- Screenshot 4 (320 x 170): TODO
-- Optional screenshot 5 (portal supports up to 6): TODO
-- Optional screenshot 6 (portal supports up to 6): TODO
+Catalog uniqueness verified against all 191 `pool/main/*/meta.json` records at official main `21ea24cfdb8d082487a4030d2551d4615d827552`: no share-code or title collision for STRP / StreamPlayer. The same check passed for Calendar / CALE and CardputerAdv / CADV.
 
-## Preflight
-
-- [x] `.deb` exists and can be parsed.
-- [x] Control fields contain Package, Version, Architecture, and Maintainer.
-- [x] Architecture is appropriate for the package (`arm64` for native binaries).
-- [x] APPLaunch `.desktop`, executable, PNG icon, and bundled font exist inside the package.
-- [ ] Package name ownership and update version are valid.
-- [ ] Listing copy and categories have been reviewed.
-- [ ] Four clean 320 x 170 baseline screenshots exist.
-- [x] No credentials, tokens, or private server details are embedded.
-- [ ] The user explicitly approved external submission.
-
-## Submission Result
-
-- Status: `not submitted`
-- Submitted at: TODO
-- Portal message: TODO
-- Actions URL: TODO
-- Tracking or pull-request URL: TODO
+The store branch also removes obsolete privileged packaging helpers and their tests. Long Esc is monitored independently in the keyboard thread and requests the existing clean SIGINT shutdown, including without hardware repeat. Per-key debug output was removed so login input is not echoed to logs.

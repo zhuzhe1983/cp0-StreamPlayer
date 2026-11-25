@@ -34,7 +34,7 @@ namespace {
 constexpr int kScreenW = 320;
 constexpr int kScreenH = 170;
 constexpr int kTopY = 22;
-constexpr const char *kAppVersion = "0.1.0-m5stack16";
+constexpr const char *kAppVersion = "0.1.0-m5stack17 (Store / LCD)";
 constexpr const char *kDeviceId = "m5cardputerzero";
 constexpr const char *kMpvSocket = "/tmp/m5cardputer-streamplayer-mpv.sock";
 constexpr const char *kControlPipe = "/tmp/m5streamplayer-control";
@@ -563,6 +563,7 @@ static const char *audio_output_wpctl_pattern(AudioOutput output)
 
 static bool audio_output_available(AudioOutput output)
 {
+    if (output == AudioOutput::Hdmi) return false;
     if (output == AudioOutput::Bluetooth) return !audio_output_pulse_sink(output).empty();
     return true;
 }
@@ -587,7 +588,7 @@ static AudioOutput next_audio_output(AudioOutput output)
 {
     const AudioOutput order[] = {
         AudioOutput::Speaker,
-        AudioOutput::Hdmi,
+        AudioOutput::Headphone,
         AudioOutput::Bluetooth,
     };
     constexpr size_t count = sizeof(order) / sizeof(order[0]);
@@ -1847,23 +1848,9 @@ static bool ffmpeg_lists(const char *section, const char *name)
 
 static bool ffmpeg_fbdev_ready(std::string &error)
 {
-    if (!command_exists("ffmpeg")) {
-        error = "系统缺少 ffmpeg，无法使用 HDMI 硬解播放。";
-        return false;
-    }
-    if (!ffmpeg_lists("-decoders", "h264_v4l2m2m")) {
-        error = "系统 ffmpeg 缺少 h264_v4l2m2m 硬解组件。";
-        return false;
-    }
-    if (!ffmpeg_lists("-muxers", "fbdev")) {
-        error = "系统 ffmpeg 缺少 fbdev 输出组件。";
-        return false;
-    }
-    if (!ffmpeg_lists("-muxers", "alsa")) {
-        error = "系统 ffmpeg 缺少 ALSA 音频输出组件。";
-        return false;
-    }
-    return true;
+    if (command_exists("ffmpeg")) return true;
+    error = "FFmpeg is required for LCD video playback.";
+    return false;
 }
 
 static bool gst_element_exists(const char *name)
@@ -1919,31 +1906,8 @@ static bool hdmi_output_connected()
 
 static void prepare_hdmi_output_mode()
 {
-    const char *mode_env = getenv("M5_HDMI_MODE");
-    std::string mode = (mode_env && *mode_env) ? mode_env : "1920x1080@60Hz";
-    std::string lowered = to_lower(trim(mode));
-    if (lowered.empty() || lowered == "keep" || lowered == "off" ||
-        lowered == "false" || lowered == "0") {
-        app_log("HDMI mode request skipped mode=" + mode);
-        return;
+    // The store edition never changes the desktop or HDMI mode.
     }
-    if (!command_exists("wlr-randr") || !path_exists("/run/user/1000/wayland-0")) return;
-
-    const char *output_env = getenv("M5_HDMI_OUTPUT");
-    std::string output = (output_env && *output_env) ? output_env : "HDMI-A-1";
-    std::string inner = "XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 "
-                        "wlr-randr --output " + shell_quote(output) +
-                        " --mode " + shell_quote(mode) +
-                        " >/dev/null 2>&1";
-    std::string cmd = inner;
-    if (getuid() == 0 && command_exists("su")) {
-        cmd = "su -s /bin/sh pi -c " + shell_quote(inner);
-    }
-    int rc = system(cmd.c_str());
-    app_log("HDMI mode request output=" + output +
-            " mode=" + mode +
-            " rc=" + std::to_string(rc));
-}
 
 static const char *hdmi_required_message()
 {
@@ -2005,13 +1969,12 @@ static bool hardware_decode_memory_ready(std::string &error)
 
 static bool gstreamer_small_fbdev_ready(std::string &error)
 {
-    if (!hardware_decode_memory_ready(error)) return false;
     if (!command_exists("gst-launch-1.0")) {
-        error = "系统缺少 gst-launch-1.0，无法使用小屏硬解播放。";
+        error = "系统缺少 gst-launch-1.0，无法使用小屏播放。";
         return false;
     }
-    if (!gst_element_exists("v4l2h264dec")) {
-        error = "系统 GStreamer 缺少 v4l2h264dec 硬解组件。";
+    if (!gst_element_exists("avdec_h264")) {
+        error = "系统 GStreamer 缺少 avdec_h264 软件解码组件。";
         return false;
     }
     if (!gst_element_exists("fbdevsink")) {
@@ -2040,39 +2003,9 @@ static std::string hdmi_drm_connector_id()
 
 static bool gstreamer_kms_ready(std::string &error)
 {
-    if (!hardware_decode_memory_ready(error)) return false;
-    if (!command_exists("gst-launch-1.0")) {
-        error = "系统缺少 gst-launch-1.0，无法使用 HDMI KMS 硬解直出。";
-        return false;
+    error = "HDMI KMS is unavailable in the LCD-only store edition.";
+    return false;
     }
-    if (!gst_element_exists("v4l2h264dec")) {
-        error = "系统 GStreamer 缺少 v4l2h264dec H.264 硬解组件。";
-        return false;
-    }
-    if (!gst_element_exists("kmssink")) {
-        error = "系统 GStreamer 缺少 kmssink DRM/KMS 输出组件。";
-        return false;
-    }
-    if (!gst_element_exists("alsasink")) {
-        error = "系统 GStreamer 缺少 alsasink 音频输出组件。";
-        return false;
-    }
-    if (access("/dev/dri/card0", R_OK | W_OK) != 0) {
-        error = "当前用户没有 HDMI DRM/KMS 设备访问权限。";
-        return false;
-    }
-    if (getuid() != 0) {
-        const int can_start =
-            system("/usr/bin/sudo -n -l /usr/bin/systemctl "
-                   "start streamplayer-display-guard.service "
-                   ">/dev/null 2>&1");
-        if (can_start != 0) {
-            error = "HDMI KMS 直出缺少 StreamPlayer 的显示守护权限。";
-            return false;
-        }
-    }
-    return true;
-}
 
 static const lv_font_t *builtin_font_14()
 {
@@ -2101,6 +2034,7 @@ static lv_font_t *g_runtime_fallback_font_16 = nullptr;
 static lv_font_t *g_runtime_fallback_font_21 = nullptr;
 static lv_font_t *g_runtime_fallback_font_28 = nullptr;
 static bool g_runtime_fonts_initialized = false;
+static UiLanguage g_runtime_font_language = UiLanguage::English;
 
 static const lv_font_t *ui_font_14()
 {
@@ -2184,7 +2118,11 @@ static std::vector<std::string> candidate_primary_font_paths()
 
 static std::vector<std::string> candidate_fallback_font_paths()
 {
-    /* Fallback = NotoSansSC (CJK glyphs for 中日英) */
+    if (g_runtime_font_language != UiLanguage::Japanese) {
+        return candidate_font_paths("M5_STREAMPLAYER_FONT_FALLBACK", "M5_STREAMPLAYER_FALLBACK_FONT", {
+            "/usr/share/streamplayer/fonts/NotoSansSC-Regular.ttf"
+        });
+    }
     return candidate_font_paths("M5_STREAMPLAYER_FONT_FALLBACK", "M5_STREAMPLAYER_FALLBACK_FONT", {
         /* Prefer NotoSansCJK-Regular.ttc (face 0 = JP) for best CJK cross-language support.
          * LVGL lv_tiny_ttf opens TTC face 0 only. The TTC covers JP, KR, SC, TC, HK.
@@ -2983,11 +2921,7 @@ public:
         reset_player_log_file();
         apply_pipewire_default_output(audio_output_);
         if (small_screen_output) {
-            if (gstreamer_small_fbdev_ready(error)) {
-                return launch_gstreamer_small_fbdev(url, error, start_seconds, video_mode);
-            }
-            app_log("HdmiPlayer small-screen failed gstreamer unavailable error=" + error);
-            return false;
+            return launch_ffmpeg_small_fbdev(url, token, error, start_seconds, video_mode);
         }
         const char *override_cmd = getenv("M5_HDMI_PLAYER");
         if (override_cmd && override_cmd[0]) {
@@ -3163,8 +3097,7 @@ public:
         if (!running()) return false;
         if (!is_gstreamer_backend()) return true;
         refresh_gstreamer_runtime_status();
-        if (ready_ && !hardware_decoder_active_) detect_hardware_decoder();
-        return ready_ && hardware_decoder_active_;
+        return ready_; // Store LCD playback intentionally uses software decoding.
     }
     bool buffering()
     {
@@ -3489,87 +3422,14 @@ private:
 
     bool acquire_kms_exclusive(std::string &error)
     {
-        if (kms_exclusive_) {
-            const bool guard_active =
-                system("/usr/bin/systemctl is-active --quiet "
-                       "streamplayer-display-guard.service >/dev/null 2>&1") == 0;
-            const bool lightdm_inactive =
-                system("/usr/bin/systemctl is-active --quiet lightdm.service "
-                       ">/dev/null 2>&1") != 0;
-            const bool guard_ready =
-                access("/run/streamplayer-resource-guard/display/ready", F_OK) == 0;
-            if (guard_active && guard_ready && lightdm_inactive) return true;
-            app_log("HDMI KMS exclusive cached state drift guard_active=" +
-                    bool_text(guard_active) +
-                    " guard_ready=" + bool_text(guard_ready) +
-                    " lightdm_inactive=" + bool_text(lightdm_inactive));
-            kms_exclusive_ = false;
-            preserve_kms_on_next_stop_ = false;
-        }
-        const char *systemctl = getuid() == 0
-            ? "/usr/bin/systemctl"
-            : "/usr/bin/sudo -n /usr/bin/systemctl";
-        const bool lightdm_was_active =
-            system("/usr/bin/systemctl is-active --quiet lightdm.service "
-                   ">/dev/null 2>&1") == 0;
-        app_log("HDMI KMS exclusive acquire lightdm_active=" +
-                bool_text(lightdm_was_active));
-        std::string start_guard =
-            std::string(systemctl) +
-            " start streamplayer-display-guard.service >/dev/null 2>&1";
-        int rc = system(start_guard.c_str());
-        if (rc != 0) {
-            error = "停止 lightdm 失败，无法独占 HDMI KMS 输出。";
-            app_log("HDMI KMS exclusive display guard start failed rc=" +
-                    std::to_string(rc));
-            return false;
-        }
-        kms_exclusive_ = true;
-        for (int i = 0; i < 80; ++i) {
-            const bool guard_active =
-                system("/usr/bin/systemctl is-active --quiet "
-                       "streamplayer-display-guard.service >/dev/null 2>&1") == 0;
-            const bool lightdm_inactive =
-                system("/usr/bin/systemctl is-active --quiet lightdm.service "
-                       ">/dev/null 2>&1") != 0;
-            const bool guard_ready =
-                access("/run/streamplayer-resource-guard/display/ready", F_OK) == 0;
-            if (guard_active && guard_ready && lightdm_inactive) {
-                const long long mem_available = meminfo_kilobytes("MemAvailable:");
-                const long long cma_free = meminfo_kilobytes("CmaFree:");
-                const long long swap_free = meminfo_kilobytes("SwapFree:");
-                app_log("HDMI KMS exclusive acquired MemAvailable_kB=" +
-                        std::to_string(mem_available) +
-                        " CmaFree_kB=" + std::to_string(cma_free) +
-                        " SwapFree_kB=" + std::to_string(swap_free));
-                if ((mem_available >= 0 && mem_available < 16 * 1024) ||
-                    (cma_free >= 0 && cma_free < 12 * 1024)) {
-                    error = "系统可用内存不足，已停止本次播放；LightDM 将在退出应用后恢复。";
-                    app_log("HDMI KMS exclusive rejected low memory");
-                    release_kms_exclusive();
-                    return false;
-                }
-                return true;
-            }
-            usleep(50000);
-        }
-        error = "等待 lightdm 释放 HDMI 超时。";
-        app_log("HDMI KMS exclusive wait lightdm inactive timed out");
-        release_kms_exclusive();
+        error = "HDMI KMS is unavailable in the LCD-only store edition.";
         return false;
     }
 
     void release_kms_exclusive()
     {
-        if (!kms_exclusive_) return;
-        /*
-         * The display guard belongs to the StreamPlayer foreground lifetime,
-         * not to an individual playback pipeline.  Clearing this local lease
-         * must not restart LightDM underneath the still-running app.
-         */
         kms_exclusive_ = false;
         preserve_kms_on_next_stop_ = false;
-        app_log("HDMI KMS pipeline lease released; display guard retained until app exit");
     }
 
     bool launch_desktop_player(const std::string &url, const std::string &token,
@@ -3717,12 +3577,6 @@ private:
             error = "小屏播放仅用于视频。";
             return false;
         }
-        /*
-         * The HDMI desktop is unrelated to the built-in LCD but consumes a
-         * significant portion of RAM/CMA on the 256 MiB board. Release it
-         * during small-screen video as well, then restore it in stop().
-         */
-        if (!acquire_kms_exclusive(error)) return false;
         std::string fbdev = small_lcd_fbdev_path();
         pid_ = fork();
         if (pid_ < 0) {
@@ -3734,7 +3588,7 @@ private:
         if (pid_ == 0) {
             prepare_child_process();
             setup_audio_output_environment(AudioOutput::Speaker);
-            setenv("GST_PLUGIN_FEATURE_RANK", "v4l2h264dec:PRIMARY,avdec_h264:SECONDARY", 1);
+            setenv("GST_PLUGIN_FEATURE_RANK", "v4l2h264dec:NONE,avdec_h264:PRIMARY", 1);
             std::vector<std::string> args = {
                 "gst-launch-1.0", "-e", "-m", "playbin",
                 "uri=" + url,
@@ -3833,7 +3687,7 @@ private:
                              "pad=320:170:(ow-iw)/2:(oh-ih)/2,format=rgb565le";
             std::vector<std::string> args = {
                 "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-re",
-                "-c:v", "h264_v4l2m2m",
+                "-threads", "1", "-c:v", "h264",
             };
             if (!token.empty()) {
                 args.push_back("-headers");
@@ -4002,14 +3856,9 @@ public:
                 " config_path=" + config_path() +
                 " poster_cache=" + poster_cache_dir());
         (void)acquire_background_performance_mode();
-        /*
-         * Apply the requested HDMI mode while LightDM's Wayland compositor is
-         * still available. The foreground display guard stops it immediately
-         * afterward and leaves APPLaunch's independent LCD framebuffer alone.
-         */
+        // The store edition does not adjust HDMI or system services.
         prepare_hdmi_output_mode();
         (void)acquire_display_performance_mode();
-        init_runtime_fonts();
         config_loaded_ = load_config(config_);
         const char *server_url_env = getenv(kServerUrlEnv);
         const char *username_env = getenv(kUsernameEnv);
@@ -4024,6 +3873,8 @@ public:
             config_.password = password_env;
         }
         if (config_.language.empty()) config_.language = language_code(language_from_code(system_language_code()));
+        g_runtime_font_language = language_from_code(config_.language);
+        init_runtime_fonts();
         app_log("Config loaded=" + bool_text(config_loaded_) +
                 " server=" + server_name(config_.type) +
                 " language=" + config_.language +
@@ -4043,7 +3894,7 @@ public:
                     ? AudioOutput::Bluetooth
                     : AudioOutput::Speaker;
             } else if (value == "hdmi") {
-                audio_output_ = AudioOutput::Hdmi;
+                audio_output_ = AudioOutput::Speaker;
             }
         }
         app_log(std::string("Audio output initial=") + audio_output_label(audio_output_));
@@ -4113,108 +3964,22 @@ public:
 private:
     bool acquire_background_performance_mode()
     {
-        const char *keep_packagekit = getenv("M5_STREAMPLAYER_KEEP_PACKAGEKIT");
-        if (keep_packagekit &&
-            (strcmp(keep_packagekit, "1") == 0 ||
-             strcmp(keep_packagekit, "true") == 0)) {
-            app_log("PackageKit performance pause skipped by environment");
-            return true;
-        }
-
-        const char *systemctl = getuid() == 0
-            ? "/usr/bin/systemctl"
-            : "/usr/bin/sudo -n /usr/bin/systemctl";
-        const std::string start_guard =
-            std::string(systemctl) +
-            " start streamplayer-background-guard.service >/dev/null 2>&1";
-        const int rc = system(start_guard.c_str());
-        if (rc == 0) background_guard_requested_ = true;
-        bool packagekit_inactive = false;
-        if (rc == 0) {
-            for (int i = 0; i < 100; ++i) {
-                const bool guard_active =
-                    system("/usr/bin/systemctl is-active --quiet "
-                           "streamplayer-background-guard.service "
-                           ">/dev/null 2>&1") == 0;
-                const bool service_inactive =
-                    system("/usr/bin/systemctl is-active --quiet packagekit.service "
-                           ">/dev/null 2>&1") != 0;
-                const bool service_masked =
-                    guard_active && service_inactive &&
-                    first_command_line(
-                        "/usr/bin/systemctl show packagekit.service "
-                        "--property=LoadState --value 2>/dev/null") == "masked";
-                const bool guard_ready =
-                    access("/run/streamplayer-resource-guard/background/ready",
-                           F_OK) == 0;
-                if (guard_active && guard_ready &&
-                    service_inactive && service_masked) {
-                    packagekit_inactive = true;
-                    break;
-                }
-                usleep(50000);
-            }
-        }
-        app_log("PackageKit background guard start rc=" + std::to_string(rc) +
-                " inactive=" + bool_text(packagekit_inactive));
-        return packagekit_inactive;
+        return true; // Foreground application only; no system-service control.
     }
 
     void restore_background_performance_mode()
     {
-        if (!background_guard_requested_) return;
-        background_guard_requested_ = false;
-        app_log("PackageKit background guard will restore after process exit");
+
     }
 
     bool acquire_display_performance_mode()
     {
-        const char *keep_lightdm = getenv("M5_STREAMPLAYER_KEEP_LIGHTDM");
-        if (keep_lightdm &&
-            (strcmp(keep_lightdm, "1") == 0 ||
-             strcmp(keep_lightdm, "true") == 0)) {
-            app_log("LightDM performance pause skipped by environment");
-            return true;
-        }
-
-        const char *systemctl = getuid() == 0
-            ? "/usr/bin/systemctl"
-            : "/usr/bin/sudo -n /usr/bin/systemctl";
-        const std::string start_guard =
-            std::string(systemctl) +
-            " start streamplayer-display-guard.service >/dev/null 2>&1";
-        const int rc = system(start_guard.c_str());
-        if (rc == 0) display_guard_requested_ = true;
-        bool lightdm_inactive = false;
-        if (rc == 0) {
-            for (int i = 0; i < 100; ++i) {
-                const bool guard_active =
-                    system("/usr/bin/systemctl is-active --quiet "
-                           "streamplayer-display-guard.service "
-                           ">/dev/null 2>&1") == 0;
-                const bool service_inactive =
-                    system("/usr/bin/systemctl is-active --quiet lightdm.service "
-                           ">/dev/null 2>&1") != 0;
-                const bool guard_ready =
-                    access("/run/streamplayer-resource-guard/display/ready",
-                           F_OK) == 0;
-                if (guard_active && guard_ready && service_inactive) {
-                    lightdm_inactive = true;
-                    break;
-                }
-                usleep(50000);
-            }
-        }
-        app_log("LightDM display guard start rc=" + std::to_string(rc) +
-                " inactive=" + bool_text(lightdm_inactive));
-        return lightdm_inactive;
+        return true; // Keep LightDM and the user desktop unchanged.
     }
 
     void restore_display_performance_mode()
     {
-        if (!display_guard_requested_) return;
-        display_guard_requested_ = false;
-        app_log("LightDM display guard will restore after process exit");
+
     }
 
     UiLanguage current_language() const
@@ -4448,8 +4213,7 @@ private:
                 lv_timer_delete(esc_short_timer_);
                 esc_short_timer_ = nullptr;
             }
-            if (view_ == View::Player) stop_playback_to_detail();
-            else exit_application("long-esc");
+            exit_application("long-esc");
             return true;
         }
         return true;
@@ -5188,9 +4952,9 @@ private:
         lv_anim_set_repeat_count(&anim, LV_ANIM_REPEAT_INFINITE);
         lv_anim_start(&anim);
 
-        label(root_, current_language() == UiLanguage::Chinese ? "正在准备小屏控制和 HDMI 输出"
-                                                               : (current_language() == UiLanguage::Japanese ? "小画面制御と HDMI 出力を準備中"
-                                                                                                              : "Preparing small-screen controls and HDMI output"),
+        label(root_, current_language() == UiLanguage::Chinese ? "正在准备小屏播放"
+                                                               : (current_language() == UiLanguage::Japanese ? "LCD 再生を準備中"
+                                                                                                              : "Preparing LCD playback"),
               10, 112, 300, 18, lv_color_hex(0x7E8A99));
         lv_timer_handler();
     }
@@ -5264,6 +5028,20 @@ private:
         else if (lang == UiLanguage::Chinese) config_.language = "ja-JP";
         else config_.language = "en";
         save_config(config_);
+        clear(); // Delete every label before releasing its font.
+#if LV_USE_TINY_TTF && LV_TINY_TTF_FILE_SUPPORT
+        lv_font_t **fonts[] = {&g_runtime_font_14, &g_runtime_font_16,
+            &g_runtime_font_21, &g_runtime_font_28, &g_runtime_fallback_font_14,
+            &g_runtime_fallback_font_16, &g_runtime_fallback_font_21,
+            &g_runtime_fallback_font_28};
+        for (lv_font_t **font : fonts) {
+            if (*font) lv_tiny_ttf_destroy(*font);
+            *font = nullptr;
+        }
+#endif
+        g_runtime_font_language = current_language();
+        g_runtime_fonts_initialized = false;
+        init_runtime_fonts();
         show_setup();
     }
 
@@ -6824,6 +6602,10 @@ private:
 
     bool restart_video_for_display_output(bool small_screen_output, const std::string &notice)
     {
+        if (!small_screen_output) {
+            set_player_notice("Store edition: LCD video only", 4);
+            return false;
+        }
         if (is_audio_item(current_item_) || is_photo_item(current_item_)) return false;
         if (!small_screen_output && !hdmi_output_connected()) {
             set_player_notice("未连接 HDMI，仍在小屏播放", 4);
@@ -7199,7 +6981,7 @@ private:
                                                                    : (current_language() == UiLanguage::Japanese ? "Space 一時停止  Z/C 早送り/巻戻し  N 次"
                                                                                                                   : "Space Pause  Z/C Seek  N Next"),
                   10, 88, 300, 16, lv_color_hex(0xD3DEE9));
-            render_track_row(106, t(TextKey::Output), player_output_label(), "Tab", true);
+            render_track_row(106, t(TextKey::Output), player_output_label(), "", false);
             render_track_row(127, t(TextKey::Audio), active_audio_caption(), "F", false);
             render_track_row(148, t(TextKey::Subtitle), active_subtitle_caption(), "X", false);
         }
@@ -7764,7 +7546,12 @@ private:
 
     void play_media_item(const MediaItem &item, bool force_small_screen)
     {
-        const bool small_screen_playback = force_small_screen && video_item_needs_hdmi(item);
+        if (is_photo_item(item)) {
+            show_error("Photo output is unavailable in the LCD-only store edition.");
+            return;
+        }
+        (void)force_small_screen;
+        const bool small_screen_playback = video_item_needs_hdmi(item);
         if (video_item_needs_hdmi(item) && !small_screen_playback && !hdmi_output_connected()) {
             show_hdmi_required_prompt(item);
             return;
