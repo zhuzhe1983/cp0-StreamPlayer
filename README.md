@@ -4,7 +4,7 @@ This branch is the user-authorized reduced Application Store edition. The origin
 
 Emby/Jellyfin music and LCD video playback, search, subtitles, and English/Chinese/Japanese UI remain. The server must supply the 320x170 H.264 LCD profile. LCD software decoding avoids privileged CMA reservation. Music uses mpv; video uses FFmpeg.
 
-Removed from this edition: root systemd guards, sudoers and NetworkManager dispatcher files, boot/CMA and Wi-Fi tuning, PackageKit/LightDM control, HDMI video/photo playback and automatic HDMI mode changes. System services and desktop state remain unchanged while the app runs. Existing manual system settings are not undone.
+Removed from this edition: root systemd guards, sudoers and NetworkManager dispatcher files, boot/CMA and Wi-Fi tuning, PackageKit/LightDM control, HDMI video/photo playback and automatic HDMI mode changes. The application never starts, stops or masks system services or changes desktop settings. Existing manual system settings are not undone.
 
 Build with `./scripts/build_deb.sh`; install with `sudo apt install ./artifacts/streamplayer_0.1.0-m5stack17_arm64.deb` so dependencies are resolved. The app runs as the APPLaunch user. Source branch: `store-compliant-20261125`.
 
