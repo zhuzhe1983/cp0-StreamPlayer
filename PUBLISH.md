@@ -34,7 +34,7 @@ User authorized publication and a separate reduced branch on 2026-11-25; the ori
 ## Submission
 
 - User explicitly requested submission; no further publication permission is needed.
-- Publish PR: <https://github.com/CardputerZero/packages/pull/840>, head `fee14d820d35e0c23b55fd105a1b5618e8715ac5`.
+- Publish PR: <https://github.com/CardputerZero/packages/pull/840>, head `18123c4a3d443962d9780fb6ff1943989fff6348`.
 - Status: submitted, open and unmerged; final device acceptance passed. Physical-device launch/use/exit video and maintainer review pending.
 
 Catalog uniqueness verified against all 191 `pool/main/*/meta.json` records at official main `21ea24cfdb8d082487a4030d2551d4615d827552`: no share-code or title collision for STRP / StreamPlayer. The same check passed for Calendar / CALE and CardputerAdv / CADV.
@@ -50,3 +50,7 @@ Session cleanup: disposable QA credentials were archived and removed from normal
 The PR staging-capture job initially failed on GitHub's release-upload endpoint with HTTP 500 after successfully downloading the exact package and passing its checksum check. Requests to rerun the failed job also returned HTTP 500, with the run still at attempt 1. A final listing update pins the correct reduced source branch and its completion timestamp; the normal synchronize event will re-run the same package-capture checks. No package or policy check is bypassed.
 
 The requested independent store worktree is retained because its branch is intentionally separate and unmerged, with store review still open. Task HTTP/fixture servers and SSH sessions were closed after archiving the actual-device receipts; normal startup has no QA account.
+
+GitHub staging asset `792140019` is uploaded, 5,565,292 bytes, with digest `sha256:7ddcf0513aa64414dd026410aa461a7c6ca1748145b7513d5b93d991671d3c68`: the earlier capture failure was its HTTP 500 response after upload. Final listing metadata was pushed normally via Git as `18123c4a3d443962d9780fb6ff1943989fff6348`, adding the correct reduced-source link and acceptance timestamp, which triggers the normal capture/validation workflow again. The temporary sparse review checkout `/tmp/cp0-streamplayer-review-20261126` is retained while the review branch remains unmerged.
+
+Final submission state: PR #840 remains open and unmerged. At head `18123c4a3d443962d9780fb6ff1943989fff6348`, `capture` and `validate` jobs both completed with success. As with the other same-repository maintainer submissions, these jobs do not imply full third-party package validation; the explicit local/current-policy and physical-device checks are recorded above. Required physical-device review video and maintainer review remain pending.
