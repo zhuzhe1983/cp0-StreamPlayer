@@ -201,4 +201,6 @@ The new review is not being pursued; no replacement video is requested here.
   bitrate, playback speed and desktop mode are unchanged.
 - GitHub source/binary update authorized by the existing delivery request.
   New application-store review remains deferred as explicitly requested.
-  GitHub release verification will be recorded after upload.
+  Verified GitHub release: [v0.1.0-m5stack21](https://github.com/zhuzhe1983/cp0-StreamPlayer/releases/tag/v0.1.0-m5stack21).
+  The uploaded asset is 5,578,340 bytes and its GitHub digest matches the
+  tested package SHA-256 above. No new store review was created.
