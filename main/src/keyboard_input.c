@@ -13,6 +13,7 @@
 #include <time.h>
 #include <signal.h>
 #include "keyboard_input.h"
+#include "keyboard_keymap.h"
 #include "lvgl/lvgl.h"
 
 #if !LV_USE_SDL
@@ -129,6 +130,10 @@ struct kbd_ctx {
     struct xkb_state          *state;
     struct xkb_compose_table  *compose_table;
     struct xkb_compose_state  *compose_state;
+
+    bool use_tca_keymap;
+    bool runtime_keymap_loaded;
+    struct tca8418_runtime_keymap runtime_keymap;
 
     /* 按键重复 */
     int      repeat_fd;
@@ -249,14 +254,31 @@ static void process_key(struct kbd_ctx *kc, uint32_t code, int pressed)
     item.key_state = pressed ? KBD_KEY_PRESSED : KBD_KEY_RELEASED;
 
     /* ---------- 1. TCA8418 自定义键码优先 ---------- */
-    const struct tca8418_keymap_entry *mapped = tca8418_keymap_lookup(code);
+    struct tca8418_keymap_entry runtime_entry = {0};
+    const struct tca8418_keymap_entry *mapped = NULL;
+    if (kc->use_tca_keymap) {
+        if (kc->runtime_keymap_loaded) {
+            const char *name = tca8418_runtime_keymap_lookup(&kc->runtime_keymap, code);
+            if (name) {
+                runtime_entry.keycode = code;
+                runtime_entry.sym_name = name;
+                mapped = &runtime_entry;
+            }
+        } else {
+            /* Older images without a readable map retain the old mapping. */
+            mapped = tca8418_keymap_lookup(code);
+        }
+    }
     if (mapped) {
         xkb_keysym_t sym = xkb_keysym_from_name(mapped->sym_name,
                                                 XKB_KEYSYM_NO_FLAGS);
         snprintf(item.sym_name, sizeof(item.sym_name), "%s", mapped->sym_name);
-        snprintf(item.utf8,     sizeof(item.utf8),     "%s", mapped->utf8);
         item.keysym    = sym;
         item.codepoint = (sym != XKB_KEY_NoSymbol) ? xkb_keysym_to_utf32(sym) : 0;
+        if (mapped->utf8)
+            snprintf(item.utf8, sizeof(item.utf8), "%s", mapped->utf8);
+        else
+            utf32_to_utf8(item.codepoint, item.utf8, sizeof(item.utf8));
         item.mods      = get_mods(kc->state);
 
         /* 重复处理 */
@@ -457,6 +479,17 @@ void *keyboard_read_thread(void *argv) {
 
     /* ---------- 2. xkbcommon ---------- */
     if (init_xkb(&kc, "us", NULL) < 0) goto out;
+
+    const char *device_name = libinput_device_get_name(kc.dev);
+    kc.use_tca_keymap = (device_name && strstr(device_name, "tca8418")) ||
+                       strstr(device_path, "3f804000.i2c");
+    if (kc.use_tca_keymap) {
+        const char *map_path = getenv("LV_LINUX_KEYBOARD_MAP");
+        if (!map_path || !*map_path)
+            map_path = "/usr/share/keymaps/tca8418_keypad_m5stack_keymap.map";
+        kc.runtime_keymap_loaded =
+            tca8418_runtime_keymap_load(&kc.runtime_keymap, map_path) > 0;
+    }
 
     /* ---------- 3. 按键重复 timerfd ---------- */
     kc.repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);

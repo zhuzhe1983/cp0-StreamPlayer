@@ -54,3 +54,48 @@ The requested independent store worktree is retained because its branch is inten
 GitHub staging asset `792140019` is uploaded, 5,565,292 bytes, with digest `sha256:7ddcf0513aa64414dd026410aa461a7c6ca1748145b7513d5b93d991671d3c68`: the earlier capture failure was its HTTP 500 response after upload. Final listing metadata was pushed normally via Git as `18123c4a3d443962d9780fb6ff1943989fff6348`, adding the correct reduced-source link and acceptance timestamp, which triggers the normal capture/validation workflow again. The temporary sparse review checkout `/tmp/cp0-streamplayer-review-20261126` is retained while the review branch remains unmerged.
 
 Final submission state: PR #840 remains open and unmerged. At head `18123c4a3d443962d9780fb6ff1943989fff6348`, `capture` and `validate` jobs both completed with success. As with the other same-repository maintainer submissions, these jobs do not imply full third-party package validation; the explicit local/current-policy and physical-device checks are recorded above. Required physical-device review video and maintainer review remain pending.
+
+## Local keyboard compatibility fix — 2026-11-27
+
+The reflashed 2026-11-19 image names the keyboard `tca8418c` and supplies
+symbols on different evdev key codes. For example, `@` is code 27, `:` is
+80, and `/` is 92. The submitted m5stack17 binary still used a built-in
+183–213 symbol table, so it interpreted these keys using a standard PC
+layout instead. The installed m5stack17 checksum matched the submission;
+this was an image-compatibility defect rather than an older package.
+
+The local fix reads the image's existing
+`/usr/share/keymaps/tca8418_keypad_m5stack_keymap.map` (or
+`LV_LINUX_KEYBOARD_MAP`) at keyboard initialization, on the TCA8418 device
+only. Ordinary letters, modifiers and navigation retain xkbcommon behavior;
+USB keyboards do not use the board's symbol map. Images without a usable
+map retain the legacy fallback. It neither rewrites the system keymap nor
+logs typed characters.
+
+- Local version: `0.1.0-m5stack18`, arm64.
+- Package: `artifacts/streamplayer_0.1.0-m5stack18_arm64.deb`; frozen copy in
+  `artifacts/publish-20261127-keymap/`.
+- Package SHA-256: `549ed1efa87093311442a9bee50d95118619826ab67e1c5dc4b20eafbb84b6fb`.
+- Executable SHA-256: `b52a457a6fb1ee01950d1046318183e236080c125928d8257b3d50b2c678b097`.
+- Portable C loader regression with AddressSanitizer/UndefinedBehaviorSanitizer:
+  passed all 32 current symbols, legacy input, missing/malformed maps,
+  duplicate entries and isolation of normal keys.
+- ARM test using the production keyboard decoder and the device's real
+  libinput/xkbcommon libraries: passed all 32 symbols on press/release,
+  ordinary a/b, Shift-A then lowercase a, Backspace/Tab, legacy fallback
+  and USB-keyboard isolation. This test opens no input device.
+- Existing HLS-seek and LAN-scan regressions: passed. ARM framebuffer build
+  and package construction: passed.
+- Installation preserved the old package files and configuration under
+  `/home/pi/streamplayer-backups/20261127T130609Z`; all 19 installed package
+  files were verified against the archive. No prior server configuration
+  files existed at backup time, and the normal configuration was not
+  populated by this test.
+- Real 320×170 framebuffer check with synthetic evdev input and a separate
+  test configuration: `ht://a.b` displayed correctly in an input field,
+  password input remained masked, and the new running process checksum
+  matched the package. No test login was submitted. APPLaunch was restored
+  active after the isolated test.
+- This is a local device fix. PR #840 and its m5stack17 submission above
+  have not been replaced or republished by this task. Production media
+  playback was not retested for this keyboard-only change.

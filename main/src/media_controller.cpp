@@ -34,7 +34,7 @@ namespace {
 constexpr int kScreenW = 320;
 constexpr int kScreenH = 170;
 constexpr int kTopY = 22;
-constexpr const char *kAppVersion = "0.1.0-m5stack17 (Store / LCD)";
+constexpr const char *kAppVersion = "0.1.0-m5stack18 (Store / LCD)";
 constexpr const char *kDeviceId = "m5cardputerzero";
 constexpr const char *kMpvSocket = "/tmp/m5cardputer-streamplayer-mpv.sock";
 constexpr const char *kControlPipe = "/tmp/m5streamplayer-control";
