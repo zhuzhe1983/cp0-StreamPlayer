@@ -60,6 +60,12 @@ short Esc back and long Esc clean exit. MPV reported `dmabuf-wayland`,
 normal account configuration stayed byte-for-byte unchanged, and APPLaunch
 was restored active. Debug frame logging was disabled for the accepted run.
 
+The final packaged/installed binary was also launched as UID 1000 using the
+existing real Emby account, playing a movie. Ten polling samples showed zero
+dropped-frame increments and zero buffering, speed 1 and about 12.8% MPV CPU
+of one core. Physical pause/resume and long Esc passed; the account config
+remained byte-for-byte unchanged and APPLaunch returned active.
+
 The fixture media is generated, and does not replace the real Emby sweep.
 Earlier trials include software scaling that dropped frames, a GPU-backend
 crash, unsupported YUV DMA output, large-pool stalls, startup timeouts, and an

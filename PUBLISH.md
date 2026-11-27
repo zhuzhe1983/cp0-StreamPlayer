@@ -168,9 +168,18 @@ Earlier failed YUV/GPU/large-pool/startup/seek trials are retained in the privat
 local task archive, not discarded or presented as successes. Generated fixture
 media and real-server measurements are identified separately.
 
-Release state: source and GitHub binary release preparation complete; upload
-and store publication receipt pending. The final URLs/status will be appended
-after verification. PR #840 is the older m5stack17 first-release review and
-remains open/unmerged; it is not evidence that m5stack20 is live in the store.
-The attached video currently shows CardputerAdv, so it is not accepted here as
-a StreamPlayer launch/play/exit demo. No self-merge will bypass first review.
+Release verified: [v0.1.0-m5stack20](https://github.com/zhuzhe1983/cp0-StreamPlayer/releases/tag/v0.1.0-m5stack20),
+published 2026-11-27 15:41:47 UTC from source
+`bf85143e92361aad388efcbb3e6667961b4a4626`. Its 5,578,596-byte Debian asset
+reports GitHub digest `sha256:aafef86bfaab35f83f1dcda4f66c721f918a6cd055806b049b53641bbff42632`,
+matching the exact tested/installed package. `SHA256SUMS` is attached too.
+The source is pushed to the public default/store branch.
+
+The current official Python czdev metadata policy passed and created
+[new review PR #980](https://github.com/CardputerZero/packages/pull/980).
+The user then explicitly said not to submit a new review yet and confirmed
+having supplied a video with the old version. PR #980 was therefore closed,
+with no merge or deployment. The older [PR #840](https://github.com/CardputerZero/packages/pull/840)
+and all its submitted video/comments remain unchanged. m5stack20 is a GitHub
+release and a verified local installation, **not a newly approved store release**.
+The new review is not being pursued; no replacement video is requested here.
