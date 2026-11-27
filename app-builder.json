@@ -2,7 +2,7 @@
   "name": "StreamPlayer",
   "package": "streamplayer",
   "package_name": "streamplayer",
-  "version": "0.1.0-m5stack20",
+  "version": "0.1.0-m5stack21",
   "app_name": "StreamPlayer",
   "bin_name": "M5CardputerZero-StreamPlayer",
   "description": "Emby and Jellyfin music, LCD video and HDMI desktop video player for CardputerZero.",

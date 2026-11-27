@@ -1,4 +1,4 @@
-# Current delivery: 0.1.0-m5stack20
+# Current delivery: 0.1.0-m5stack21
 
 The latest section at the end records the HDMI DMA-BUF release. Older sections
 below retain the m5stack17/18 submission history and its original limitations.
@@ -183,3 +183,22 @@ with no merge or deployment. The older [PR #840](https://github.com/CardputerZer
 and all its submitted video/comments remain unchanged. m5stack20 is a GitHub
 release and a verified local installation, **not a newly approved store release**.
 The new review is not being pursued; no replacement video is requested here.
+
+## Fullscreen placement correction — 2026-11-28
+
+- Version `0.1.0-m5stack21`, ARM64, installed on the physical device.
+- Package SHA-256: `8817f8bfc7b8ecaef28eb6adfcda507eac6b0df83d313a4872df0f64a8dcf2be`.
+- Executable SHA-256: `abbe56362f18c796e1d5716d809349054ea8e43923ce0cb869206389fe486dbe`.
+- Backup before installation: `/home/pi/streamplayer-center-20261127/delivery/backups/20261127T160213Z`.
+- Prior installed version: m5stack20. All 19 payload files and runtime
+  dependencies verified; account configuration unchanged; APPLaunch active.
+- The reported *The Dog Stars* playback is centered both on initial startup
+  and after LCD→HDMI, verified using visible same-frame decoder/HDMI images
+  and a displaced-reference negative control. Generated 16:9/4:3 border clips,
+  ASan/UBSan option regression, ARM build and package preflight passed.
+- [Placement evidence and limitations](docs/fullscreen-placement-20261128.md).
+  Natural aspect ratio and source letterboxing are preserved. DMA settings,
+  bitrate, playback speed and desktop mode are unchanged.
+- GitHub source/binary update authorized by the existing delivery request.
+  New application-store review remains deferred as explicitly requested.
+  GitHub release verification will be recorded after upload.

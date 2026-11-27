@@ -80,6 +80,8 @@ int main()
         const auto options = streamplayer::desktop_video_options("HDMI-A-2", paused);
         auto has = [&](const char *s) { return std::find(options.begin(), options.end(), s) != options.end(); };
         assert(has("--fs-screen-name=HDMI-A-2"));
+        assert(has("--geometry=100%x100%"));
+        assert(has("--border=no"));
         assert(has("--speed=1"));
         assert(has("--vo=dmabuf-wayland,wlshm"));
         assert(has("--hwdec=v4l2m2m"));

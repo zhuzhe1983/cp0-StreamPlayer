@@ -1,8 +1,12 @@
 # StreamPlayer for CardputerZero
 
 Browse/search Emby and Jellyfin libraries, play music, and watch video on the
-built-in LCD or a connected HDMI screen. Version `0.1.0-m5stack20` keeps the
+built-in LCD or a connected HDMI screen. Version `0.1.0-m5stack21` keeps the
 refreshed-image keyboard-symbol fix and restores ordinary-user HDMI video.
+
+Version m5stack21 also initializes the HDMI window at the full output size
+without decorations, avoiding a first-start DMA fullscreen placement offset.
+Video retains its aspect ratio and any letterboxing; it is not cropped to fit.
 
 Connect HDMI before opening a video: it starts on the external display and
 the LCD keeps the playback controls. **Tab** switches LCD/HDMI, **Space**
@@ -37,7 +41,7 @@ PlaybackInfo. The private local HLS seek fallback explicitly permits its
 HTTP/HTTPS segments; unrelated local files do not get that extra permission.
 
 Build with `./scripts/build_deb.sh`; install with
-`sudo apt install ./artifacts/streamplayer_0.1.0-m5stack20_arm64.deb` so runtime
+`sudo apt install ./artifacts/streamplayer_0.1.0-m5stack21_arm64.deb` so runtime
 dependencies are resolved. The app runs as the APPLaunch user; HDMI requires
 an existing Wayland desktop and mpv. Source branch: `store-compliant-20261125`.
 

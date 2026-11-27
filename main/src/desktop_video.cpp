@@ -123,6 +123,10 @@ std::vector<std::string> desktop_video_options(const std::string &output,
     if (output.empty()) return {};
     return {
         "--no-config", "--fs-screen-name=" + output,
+        // Map the first window at the output size, before the compositor's
+        // fullscreen configure. A video-sized initial window can leave its
+        // centered offset attached to the larger DMA-BUF surface on labwc.
+        "--geometry=100%x100%", "--border=no",
         "--vo=dmabuf-wayland,wlshm", "--hwdec=v4l2m2m", "--vd-lavc-threads=2",
         "--vd-lavc-o=pixel_format=bgr0,num_capture_buffers=4,num_output_buffers=2",
         "--hwdec-extra-frames=0",
