@@ -1,6 +1,7 @@
 #include "media_controller.h"
 #include "hls_seek.h"
 #include "lan_scan.h"
+#include "desktop_video.h"
 #include "ui/ui.h"
 
 #include "lvgl/src/libs/tiny_ttf/lv_tiny_ttf.h"
@@ -21,8 +22,10 @@
 #include <signal.h>
 #include <ctime>
 #include <pwd.h>
+#include <poll.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -34,7 +37,7 @@ namespace {
 constexpr int kScreenW = 320;
 constexpr int kScreenH = 170;
 constexpr int kTopY = 22;
-constexpr const char *kAppVersion = "0.1.0-m5stack18 (Store / LCD)";
+constexpr const char *kAppVersion = "0.1.0-m5stack20 (LCD / HDMI DMA)";
 constexpr const char *kDeviceId = "m5cardputerzero";
 constexpr const char *kMpvSocket = "/tmp/m5cardputer-streamplayer-mpv.sock";
 constexpr const char *kControlPipe = "/tmp/m5streamplayer-control";
@@ -44,16 +47,12 @@ constexpr int kGstreamerBufferSizeBytes = 4 * 1024 * 1024;
 constexpr uint64_t kPlayerStartupTimeoutMs = 60000;
 constexpr int kItemsPageSize = 24;
 constexpr int kLazyLoadThreshold = 5;
-constexpr int kTranscodeMaxWidth = 1920;
-constexpr int kTranscodeMaxHeight = 1080;
+constexpr int kTranscodeMaxWidth = streamplayer::kHdmiMaxWidth;
+constexpr int kTranscodeMaxHeight = streamplayer::kHdmiMaxHeight;
 constexpr int kTranscodeMaxFramerate = 24;
-/*
- * Emby treats VideoBitrate as both a bandwidth ceiling and a resolution
- * quality hint.  At 3.0 Mbps it negotiates 1280x720 even when MaxWidth and
- * MaxHeight advertise 1920x1080.  3.8 Mbps is the lowest verified threshold
- * that keeps the server-side HLS rendition at 1920x1080 on the target setup.
- */
-constexpr int kTranscodeVideoBitrate = 3800000;
+// Bound server requests by both the attached screen and conservative device
+// limits. The compositor retains its existing display mode and scales RGB DMA frames.
+constexpr int kTranscodeVideoBitrate = streamplayer::kHdmiMaxVideoBitrate;
 constexpr int kTranscodeAudioBitrate = 128000;
 constexpr int kTranscodeMaxBitrate = kTranscodeVideoBitrate + kTranscodeAudioBitrate;
 constexpr int kSmallScreenTranscodeMaxWidth = 320;
@@ -105,6 +104,7 @@ struct MediaItem {
     std::string name;
     std::string type;
     std::string media_type;
+    bool is_folder = false;
     std::string parent_id;
     std::string overview;
     std::string album;
@@ -1056,6 +1056,7 @@ static MediaItem parse_item(const std::string &object)
     item.name = json_get_string(object, "Name");
     item.type = json_get_string(object, "Type");
     item.media_type = json_get_string(object, "MediaType");
+    item.is_folder = json_get_bool(object, "IsFolder");
     item.parent_id = json_get_string(object, "ParentId");
     item.overview = json_get_string(object, "Overview");
     item.album = json_get_string(object, "Album");
@@ -1341,16 +1342,20 @@ static bool prepare_hls_seek_playlist(const std::string &remote_url,
      * only as EXT-X-START.  gst-launch playbin on the target starts at segment
      * zero anyway, so make the requested segment the first entry explicitly.
      */
-    HttpResponse master = curl_request("GET", remote_url, token, "", 8, 35);
+    // Fetch the complete list before trimming it ourselves. Some servers
+    // already trim StartTimeTicks responses, which would otherwise seek twice.
+    const std::string full_url = set_query_param(remote_url, "StartTimeTicks", "0");
+    HttpResponse master = curl_request("GET", full_url, token, "", 8, 35);
     if (!master.ok) {
         error = "快进播放列表加载失败";
         return false;
     }
 
-    std::string media_url = remote_url;
+    std::string media_url = full_url;
     std::string media_playlist = master.body;
     std::string variant_url;
-    if (hls_master_variant_uri(master.body, remote_url, variant_url)) {
+    if (hls_master_variant_uri(master.body, full_url, variant_url)) {
+        variant_url = set_query_param(variant_url, "StartTimeTicks", "0");
         HttpResponse variant = curl_request("GET", variant_url, token, "", 8, 35);
         if (!variant.ok) {
             error = "快进媒体列表加载失败";
@@ -1361,7 +1366,7 @@ static bool prepare_hls_seek_playlist(const std::string &remote_url,
     }
 
     HlsSeekPlaylist rewritten =
-        hls_trim_media_playlist(media_playlist, media_url, requested_seconds);
+        hls_trim_media_playlist(media_playlist, media_url, requested_seconds, token);
     if (!rewritten.ok) {
         error = "快进播放列表无法裁剪: " + rewritten.error;
         return false;
@@ -1473,7 +1478,7 @@ static const char *ui_text(UiLanguage language, TextKey key)
     case TextKey::PreparingMusic: return ja ? "音楽を準備中..." : (zh ? "准备音乐..." : "Preparing music...");
     case TextKey::PreparingPhoto: return ja ? "画像を準備中..." : (zh ? "准备图片..." : "Preparing photo...");
     case TextKey::PreparingSmallScreen: return ja ? "小画面再生を準備中..." : (zh ? "准备小屏播放..." : "Preparing small-screen playback...");
-    case TextKey::RequestTranscode: return ja ? "サーバーに 1080p24 変換を要求中..." : (zh ? "请求服务器 1080p24 转码..." : "Requesting 1080p24 transcode...");
+    case TextKey::RequestTranscode: return ja ? "サーバーに 720p24 変換を要求中..." : (zh ? "请求服务器 720p24 转码..." : "Requesting 720p24 transcode...");
     case TextKey::NoPlayable: return ja ? "このアイテムには再生できる URL がありません。" : (zh ? "这个媒体没有可播放地址。" : "This item has no playable URL.");
     case TextKey::NoOverview: return ja ? "サーバーから概要がありません。" : (zh ? "服务器没有提供简介。" : "No overview from server.");
     case TextKey::DetailHelp:
@@ -1525,6 +1530,16 @@ static std::string recent_played_query()
 static bool is_series_item(const MediaItem &item)
 {
     return item.type == "Series";
+}
+
+static bool is_season_item(const MediaItem &item)
+{
+    return item.type == "Season";
+}
+
+static bool is_media_container(const MediaItem &item)
+{
+    return item.is_folder || is_series_item(item) || is_season_item(item);
 }
 
 static bool is_episode_item(const MediaItem &item)
@@ -2569,11 +2584,19 @@ public:
     bool playback_info(const MediaItem &item, PlaybackChoice &choice, std::string &error,
                        bool small_screen = false)
     {
-        const int target_width = small_screen ? kSmallScreenTranscodeMaxWidth : kTranscodeMaxWidth;
-        const int target_height = small_screen ? kSmallScreenTranscodeMaxHeight : kTranscodeMaxHeight;
-        const int target_video_bitrate = small_screen ? kSmallScreenTranscodeVideoBitrate : kTranscodeVideoBitrate;
-        const int target_max_bitrate = small_screen ? kSmallScreenTranscodeMaxBitrate : kTranscodeMaxBitrate;
-        const std::string target_label = small_screen ? "320x170" : "1080p24";
+        if (is_media_container(item)) {
+            error = "这是媒体目录，请先选择其中的一集。";
+            return false;
+        }
+        const auto output_size = streamplayer::desktop_output_size();
+        const auto target_profile = streamplayer::video_profile(small_screen, output_size.first, output_size.second);
+        const int target_width = target_profile.width;
+        const int target_height = target_profile.height;
+        const int target_video_bitrate = target_profile.video_bitrate;
+        const int target_max_bitrate = target_profile.video_bitrate + target_profile.audio_bitrate;
+        const std::string target_label = small_screen ? "320x170" :
+            std::to_string(target_width) + "x" + std::to_string(target_height) + "@24 <=" +
+            std::to_string(target_video_bitrate / 1000000) + "Mbps";
         app_log("PlaybackInfo request item=" + item.id + " name=" + item.name +
                 " codec=" + item.video_codec + "/" + item.audio_codec +
                 " size=" + std::to_string(item.width) + "x" + std::to_string(item.height) +
@@ -2697,7 +2720,7 @@ public:
             return false;
         }
 
-        choice.url = best_transcode;
+        choice.url = streamplayer::constrain_transcode_url(best_transcode, target_profile);
         choice.transcoding = true;
         choice.summary = target_label + " H.264/AAC transcode";
         choice.media_source_id = best_source_id;
@@ -2892,7 +2915,7 @@ public:
                bool keep_open = false, bool video_mode = true,
                AudioOutput audio_output = AudioOutput::Speaker,
                long long start_seconds = 0,
-               bool small_screen_output = false)
+               bool small_screen_output = false, bool start_paused = false)
     {
         std::string next_temporary_playlist =
             temporary_seek_playlist_from_url(url);
@@ -2921,7 +2944,16 @@ public:
         reset_player_log_file();
         apply_pipewire_default_output(audio_output_);
         if (small_screen_output) {
-            return launch_ffmpeg_small_fbdev(url, token, error, start_seconds, video_mode);
+            const bool started = launch_ffmpeg_small_fbdev(url, token, error, start_seconds, video_mode);
+            if (started && start_paused) pause();
+            return started;
+        }
+        if (video_mode) {
+            if (!desktop_video_available()) {
+                error = "HDMI 输出需要已连接的外屏、桌面会话和 mpv。";
+                return false;
+            }
+            return launch_mpv(url, token, error, keep_open, start_seconds, true, start_paused);
         }
         const char *override_cmd = getenv("M5_HDMI_PLAYER");
         if (override_cmd && override_cmd[0]) {
@@ -2994,6 +3026,10 @@ public:
             preserve_kms_on_next_stop_ && kms_exclusive_;
         preserve_kms_on_next_stop_ = false;
         if (pid_ > 0) {
+            if (paused_ && backend_ != "mpv") {
+                if (kill(-pid_, SIGCONT) != 0 && errno == ESRCH)
+                    kill(pid_, SIGCONT);
+            }
             const bool graceful_gst_stop = is_gstreamer_backend();
             const int stop_signal = graceful_gst_stop ? SIGINT : SIGTERM;
             const int wait_attempts = graceful_gst_stop ? 200 : 20;
@@ -3026,6 +3062,7 @@ public:
             release_kms_exclusive();
         }
         paused_ = false;
+        desktop_video_ = false;
         ready_ = false;
         buffering_ = false;
         playing_seen_ = false;
@@ -3065,6 +3102,16 @@ public:
     bool cycle_subtitle() { return mpv_command("{\"command\":[\"cycle\",\"sub\"]}\n"); }
 
     const std::string &backend() const { return backend_; }
+    static bool desktop_video_available()
+    {
+        const std::string runtime = runtime_dir();
+        const char *display = getenv("WAYLAND_DISPLAY");
+        const bool wayland = display && *display
+            ? path_exists((display[0] == '/' ? std::string(display) : runtime + "/" + display).c_str())
+            : path_exists((runtime + "/wayland-0").c_str()) || path_exists((runtime + "/wayland-1").c_str());
+        return !streamplayer::connected_hdmi_output().empty() &&
+               wayland && command_exists("mpv");
+    }
     bool paused() const { return paused_; }
     bool running()
     {
@@ -3095,12 +3142,25 @@ public:
     bool ready()
     {
         if (!running()) return false;
+        if (backend_ == "mpv" && desktop_video_) {
+            if (ready_) return true;
+            std::string reply;
+            if (mpv_command("{\"command\":[\"get_property\",\"vo-configured\"]}\n", &reply))
+                ready_ = json_get_bool(reply, "data", false);
+            return ready_;
+        }
         if (!is_gstreamer_backend()) return true;
         refresh_gstreamer_runtime_status();
         return ready_; // Store LCD playback intentionally uses software decoding.
     }
     bool buffering()
     {
+        if (backend_ == "mpv" && desktop_video_ && ready_) {
+            std::string reply;
+            if (mpv_command("{\"command\":[\"get_property\",\"paused-for-cache\"]}\n", &reply))
+                buffering_ = json_get_bool(reply, "data", false);
+            return buffering_;
+        }
         if (!is_gstreamer_backend() || !running()) return false;
         refresh_gstreamer_runtime_status();
         return buffering_;
@@ -3160,28 +3220,10 @@ private:
 
     bool video_target_uses_kms(bool small_screen_output) const
     {
-        if (small_screen_output) return true;
-        if (getenv("M5_HDMI_PLAYER") && getenv("M5_HDMI_PLAYER")[0]) return false;
-
-        const char *backend = getenv("M5_HDMI_BACKEND");
-        if (backend) {
-            if (strcmp(backend, "kms") == 0 ||
-                strcmp(backend, "gstreamer-kms") == 0 ||
-                strcmp(backend, "gstreamer") == 0) {
-                return true;
-            }
-            if (strcmp(backend, "desktop") == 0 ||
-                strcmp(backend, "wayland") == 0 ||
-                strcmp(backend, "gstreamer-wayland") == 0 ||
-                strcmp(backend, "ffmpeg-fbdev") == 0 ||
-                strcmp(backend, "ffplay") == 0 ||
-                strcmp(backend, "mpv") == 0 ||
-                strcmp(backend, "cvlc") == 0 ||
-                strcmp(backend, "vlc") == 0) {
-                return false;
-            }
-        }
-        return command_exists("gst-launch-1.0");
+        // This edition uses the compositor for HDMI and fbdev for the LCD.
+        // It never acquires DRM master or stops the desktop.
+        (void)small_screen_output;
+        return false;
     }
 
     bool detect_hardware_decoder()
@@ -3454,8 +3496,14 @@ private:
     }
 
     bool launch_mpv(const std::string &url, const std::string &token, std::string &error,
-                    bool keep_open, long long start_seconds)
+                    bool keep_open, long long start_seconds,
+                    bool desktop_video = false, bool start_paused = false)
     {
+        const std::string hdmi_output = desktop_video ? streamplayer::connected_hdmi_output() : std::string();
+        if (desktop_video && hdmi_output.empty()) {
+            error = "HDMI 已断开，请连接外屏后重试。";
+            return false;
+        }
         unlink(kMpvSocket);
         pid_ = fork();
         if (pid_ < 0) {
@@ -3474,8 +3522,20 @@ private:
                 keep_open ? "--keep-open=yes" : "--keep-open=no",
                 "--really-quiet", "--audio-display=no",
                 "--input-ipc-server=/tmp/m5cardputer-streamplayer-mpv.sock",
-                "--http-header-fields=" + header,
             };
+            if (!token.empty() && hls_local_seek_playlist_path(url).empty())
+                args.push_back("--http-header-fields=" + header);
+            if (desktop_video) {
+                const auto options = streamplayer::desktop_video_options(hdmi_output, start_paused);
+                args.insert(args.end(), options.begin(), options.end());
+            }
+            const auto input_options = hls_seek_input_options(url, true);
+            args.insert(args.end(), input_options.begin(), input_options.end());
+            // Opt-in diagnostics reuse the private (0600) child log prepared
+            // above. Default playback performs no per-frame file logging.
+            const char *debug_mpv = getenv("M5_STREAMPLAYER_DEBUG_MPV");
+            if (debug_mpv && strcmp(debug_mpv, "1") == 0)
+                args.push_back(std::string("--log-file=") + kPlayerLog);
             if (keep_open) args.push_back("--image-display-duration=inf");
             if (start_seconds > 0) args.push_back("--start=" + seconds_arg(start_seconds));
             args.push_back(url);
@@ -3483,6 +3543,9 @@ private:
             _exit(127);
         }
         backend_ = "mpv";
+        desktop_video_ = desktop_video;
+        paused_ = start_paused;
+        started_monotonic_ms_ = monotonic_ms();
         last_start_offset_supported_ = true;
         app_log("HdmiPlayer mpv started pid=" + std::to_string(static_cast<long long>(pid_)) +
                 " keep_open=" + bool_text(keep_open) +
@@ -3635,7 +3698,7 @@ private:
                 "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-re",
                 "-c:v", "h264_v4l2m2m",
             };
-            if (!token.empty()) {
+            if (!token.empty() && hls_local_seek_playlist_path(url).empty()) {
                 args.push_back("-headers");
                 args.push_back(header);
             }
@@ -3643,6 +3706,8 @@ private:
                 args.push_back("-ss");
                 args.push_back(seconds_arg(start_seconds));
             }
+            const auto input_options = hls_seek_input_options(url, false);
+            args.insert(args.end(), input_options.begin(), input_options.end());
             args.push_back("-i");
             args.push_back(url);
             args.insert(args.end(), {
@@ -3689,7 +3754,7 @@ private:
                 "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-re",
                 "-threads", "1", "-c:v", "h264",
             };
-            if (!token.empty()) {
+            if (!token.empty() && hls_local_seek_playlist_path(url).empty()) {
                 args.push_back("-headers");
                 args.push_back(header);
             }
@@ -3697,6 +3762,8 @@ private:
                 args.push_back("-ss");
                 args.push_back(seconds_arg(start_seconds));
             }
+            const auto input_options = hls_seek_input_options(url, false);
+            args.insert(args.end(), input_options.begin(), input_options.end());
             args.push_back("-i");
             args.push_back(url);
             args.insert(args.end(), {
@@ -3791,7 +3858,7 @@ private:
         return true;
     }
 
-    bool mpv_command(const std::string &json)
+    bool mpv_command(const std::string &json, std::string *response = nullptr)
     {
         if (backend_ != "mpv") return false;
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -3799,20 +3866,53 @@ private:
         sockaddr_un addr {};
         addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, kMpvSocket, sizeof(addr.sun_path) - 1);
+        timeval timeout {0, 100000};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         bool ok = connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0;
-        if (ok) ok = write(fd, json.c_str(), json.size()) == static_cast<ssize_t>(json.size());
+        std::string request = trim(json);
+        if (request.empty() || request.back() != '}') ok = false;
+        if (ok) {
+            request.pop_back();
+            request += ",\"request_id\":19}\n";
+            int flags = 0;
+#ifdef MSG_NOSIGNAL
+            flags = MSG_NOSIGNAL;
+#endif
+#ifdef SO_NOSIGPIPE
+            int no_sigpipe = 1;
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
+            ok = send(fd, request.c_str(), request.size(), flags) == static_cast<ssize_t>(request.size());
+        }
+        std::string pending;
+        bool acknowledged = false;
+        size_t received = 0;
+        const uint64_t deadline = monotonic_ms() + 150;
+        while (ok && received < 32768 && monotonic_ms() < deadline) {
+            char buffer[2048];
+            const ssize_t count = read(fd, buffer, sizeof(buffer));
+            if (count <= 0) break;
+            received += static_cast<size_t>(count);
+            pending.append(buffer, static_cast<size_t>(count));
+            size_t newline;
+            while ((newline = pending.find('\n')) != std::string::npos) {
+                const std::string line = pending.substr(0, newline);
+                pending.erase(0, newline + 1);
+                if (json_get_int(line, "request_id", -1) != 19) continue;
+                acknowledged = json_get_string(line, "error") == "success";
+                if (response) *response = line;
+                ok = false;
+                break;
+            }
+        }
         close(fd);
-        return ok;
+        return acknowledged;
     }
 
     static std::string temporary_seek_playlist_from_url(const std::string &url)
     {
-        constexpr const char *prefix = "file:///tmp/m5streamplayer-seek-";
-        if (url.compare(0, strlen(prefix), prefix) != 0 ||
-            url.size() < 5 || url.compare(url.size() - 5, 5, ".m3u8") != 0) {
-            return std::string();
-        }
-        return url.substr(strlen("file://"));
+        return hls_local_seek_playlist_path(url);
     }
 
     void cleanup_temporary_seek_playlist()
@@ -3832,6 +3932,7 @@ private:
     std::string backend_;
     std::string temporary_seek_playlist_;
     bool paused_ = false;
+    bool desktop_video_ = false;
     AudioOutput audio_output_ = AudioOutput::Speaker;
     bool last_start_offset_supported_ = true;
     bool kms_exclusive_ = false;
@@ -3959,6 +4060,13 @@ public:
         }
         unlink(kControlPipe);
         app_log("MediaController shutdown complete");
+    }
+
+    int intercept_tab(int pressed)
+    {
+        if (view_ != View::Player) return 0;
+        if (pressed) handle_key(LV_KEY_NEXT);
+        return 1;
     }
 
 private:
@@ -5577,18 +5685,48 @@ private:
     {
         LibraryState *state = current_library_state();
         if (!state || state->items.empty() || state->selected >= state->items.size()) return false;
-        const MediaItem &series = state->items[state->selected];
-        if (!is_series_item(series)) return false;
+        return expand_media_container(state->items[state->selected]);
+    }
 
-        if (state->expanded && state->expanded_series_id == series.id) {
+    bool expand_media_container(MediaItem series)
+    {
+        LibraryState *state = current_library_state();
+        if (!state) return false;
+        if (!is_series_item(series) && !is_season_item(series)) {
+            show_error("请从对应媒体库打开这个目录，再选择视频。");
+            return false;
+        }
+        const std::string series_id = is_season_item(series)
+            ? (series.series_id.empty() ? series.parent_id : series.series_id) : series.id;
+        if (series_id.empty()) {
+            show_error("服务器没有返回这季所属的剧集。请从剧集媒体库打开。");
+            return false;
+        }
+
+        if (state->expanded && state->expanded_series_id == series_id &&
+            (!is_season_item(series) || (state->season_selected < state->seasons.size() &&
+             state->seasons[state->season_selected].id == series.id))) {
             render_browse();
             return true;
         }
 
         reset_expansion(*state);
         state->expanded = true;
-        state->expanded_series_id = series.id;
-        state->expanded_series_name = series.name;
+        state->expanded_series_id = series_id;
+        state->expanded_series_name = series.series_name.empty() ? series.name : series.series_name;
+
+        if (is_season_item(series)) {
+            state->seasons = {series};
+            state->season_episodes.resize(1);
+            state->season_loaded.assign(1, false);
+            state->season_selected = 0;
+            if (!ensure_expanded_episodes(*state, true)) {
+                show_error(state->expand_error.empty() ? "集数加载失败。" : state->expand_error);
+                return false;
+            }
+            render_browse();
+            return true;
+        }
 
         if (series.id.find("demo-") == 0) {
             build_demo_series_expansion(*state, series);
@@ -6602,8 +6740,8 @@ private:
 
     bool restart_video_for_display_output(bool small_screen_output, const std::string &notice)
     {
-        if (!small_screen_output) {
-            set_player_notice("Store edition: LCD video only", 4);
+        if (!small_screen_output && !HdmiPlayer::desktop_video_available()) {
+            set_player_notice("HDMI 未就绪：请检查外屏和桌面会话", 5);
             return false;
         }
         if (is_audio_item(current_item_) || is_photo_item(current_item_)) return false;
@@ -6614,6 +6752,7 @@ private:
         }
 
         long long seconds = clamped_playback_position(current_playback_seconds());
+        const bool was_paused = playback_paused_;
         const int audio_stream_index = selected_server_stream_index(selected_audio_stream_);
         const int subtitle_stream_index = selected_server_stream_index(selected_subtitle_stream_);
         std::string error;
@@ -6635,7 +6774,7 @@ private:
         const bool preserved_kms =
             player_.preserve_kms_for_restart(small_screen_output);
         if (!player_.start(url, config_.access_token, error, false, true,
-                           target_audio, 0, small_screen_output)) {
+                           target_audio, 0, small_screen_output, was_paused)) {
             if (preserved_kms) player_.stop();
             set_player_notice(error.empty() ? "切换输出失败" : ellipsize(error, 40), 4);
             app_log("Video output switch failed item=" + current_item_.id +
@@ -6662,7 +6801,7 @@ private:
         playback_seek_seconds_ = seconds;
         playback_started_at_ = 0;
         playback_paused_seconds_ = seconds;
-        playback_paused_ = false;
+        playback_paused_ = was_paused;
         playback_pipeline_ready_ = false;
         playback_buffering_ = false;
         playback_buffering_started_ms_ = 0;
@@ -6684,7 +6823,14 @@ private:
     {
         bool target_small = !small_screen_playback_;
         std::string notice = target_small ? "输出切到小屏" : "输出切到 HDMI 大屏";
-        restart_video_for_display_output(target_small, notice);
+        const long long position = current_playback_seconds();
+        if (!restart_video_for_display_output(target_small, notice) &&
+            small_screen_playback_ && !playback_paused_ && player_.pause()) {
+            // Show the failure on the control screen instead of clearing the
+            // LCD while a video process is still drawing over the notice.
+            playback_paused_seconds_ = position;
+            playback_paused_ = player_.paused();
+        }
         render_player();
     }
 
@@ -6896,7 +7042,7 @@ private:
     void render_player()
     {
         view_ = View::Player;
-        if (small_screen_playback_) {
+        if (small_screen_playback_ && !playback_paused_) {
             clear(lv_color_hex(0x000000));
             add_to_group(root_);
             lv_group_focus_obj(root_);
@@ -6981,7 +7127,7 @@ private:
                                                                    : (current_language() == UiLanguage::Japanese ? "Space 一時停止  Z/C 早送り/巻戻し  N 次"
                                                                                                                   : "Space Pause  Z/C Seek  N Next"),
                   10, 88, 300, 16, lv_color_hex(0xD3DEE9));
-            render_track_row(106, t(TextKey::Output), player_output_label(), "", false);
+            render_track_row(106, t(TextKey::Output), player_output_label(), "Tab", true);
             render_track_row(127, t(TextKey::Audio), active_audio_caption(), "F", false);
             render_track_row(148, t(TextKey::Subtitle), active_subtitle_caption(), "X", false);
         }
@@ -7421,6 +7567,7 @@ private:
                 set_player_notice("播放器不支持暂停");
             }
             report_playback_progress(true);
+            if (small_screen_playback_) render_player();
             update_player_progress();
         }
         else if (key == LV_KEY_LEFT || key == LV_KEY_RIGHT) {
@@ -7523,8 +7670,8 @@ private:
     {
         const MediaItem *item = selected_item();
         if (!item) return;
-        if (is_series_item(*item)) {
-            expand_selected_series();
+        if (is_media_container(*item)) {
+            expand_media_container(*item);
             return;
         }
         play_media_item(*item, false);
@@ -7546,12 +7693,17 @@ private:
 
     void play_media_item(const MediaItem &item, bool force_small_screen)
     {
-        if (is_photo_item(item)) {
-            show_error("Photo output is unavailable in the LCD-only store edition.");
+        if (is_media_container(item)) {
+            expand_media_container(item);
             return;
         }
-        (void)force_small_screen;
-        const bool small_screen_playback = video_item_needs_hdmi(item);
+        if (is_photo_item(item)) {
+            show_error("Photo playback is not enabled in this edition.");
+            return;
+        }
+        const bool small_screen_playback = video_item_needs_hdmi(item) &&
+            streamplayer::use_small_video_output(force_small_screen,
+                hdmi_output_connected(), HdmiPlayer::desktop_video_available());
         if (video_item_needs_hdmi(item) && !small_screen_playback && !hdmi_output_connected()) {
             show_hdmi_required_prompt(item);
             return;
@@ -7740,4 +7892,9 @@ extern "C" void media_controller_attach_keyboard(lv_indev_t *preferred)
 extern "C" void media_controller_shutdown(void)
 {
     g_controller.shutdown();
+}
+
+extern "C" int media_controller_intercept_tab(int pressed)
+{
+    return g_controller.intercept_tab(pressed);
 }

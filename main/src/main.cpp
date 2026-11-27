@@ -147,26 +147,32 @@ static void keypad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     (void)indev;
 
     data->state = LV_INDEV_STATE_RELEASED;
+    data->key = 0;
     data->continue_reading = false;
 
+    struct key_item *key = nullptr;
     pthread_mutex_lock(&keyboard_mutex);
     if (!STAILQ_EMPTY(&keyboard_queue))
     {
-        struct key_item *key = STAILQ_FIRST(&keyboard_queue);
+        key = STAILQ_FIRST(&keyboard_queue);
         STAILQ_REMOVE_HEAD(&keyboard_queue, entries);
-
-        data->key = evdev_key_to_lvgl(key);
-        if (data->key)
-        {
-            data->state = key->key_state == KBD_KEY_RELEASED
-                              ? LV_INDEV_STATE_RELEASED
-                              : LV_INDEV_STATE_PRESSED;
-            data->continue_reading = !STAILQ_EMPTY(&keyboard_queue);
-        }
-
-        free(key);
     }
+    data->continue_reading = !STAILQ_EMPTY(&keyboard_queue);
     pthread_mutex_unlock(&keyboard_mutex);
+    if (!key) return;
+    // Playback Tab is an action, while LV_KEY_NEXT is consumed internally by
+    // LVGL for focus navigation before the screen receives LV_EVENT_KEY.
+    // Dispatch outside the queue mutex: switching output can perform I/O.
+    if (key->key_code == KEY_TAB &&
+        media_controller_intercept_tab(key->key_state == KBD_KEY_PRESSED)) {
+        free(key);
+        return;
+    }
+    data->key = evdev_key_to_lvgl(key);
+    if (data->key)
+        data->state = key->key_state == KBD_KEY_RELEASED
+                          ? LV_INDEV_STATE_RELEASED : LV_INDEV_STATE_PRESSED;
+    free(key);
 }
 
 static void lv_linux_indev_init(void)

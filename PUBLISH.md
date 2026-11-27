@@ -1,3 +1,8 @@
+# Current delivery: 0.1.0-m5stack20
+
+The latest section at the end records the HDMI DMA-BUF release. Older sections
+below retain the m5stack17/18 submission history and its original limitations.
+
 # StreamPlayer store edition publication
 
 User authorized publication and a separate reduced branch on 2026-11-25; the original uncommitted UI changes remain in the original working tree. Original application license: MIT, explicitly selected by the user.
@@ -99,3 +104,73 @@ logs typed characters.
 - This is a local device fix. PR #840 and its m5stack17 submission above
   have not been replaced or republished by this task. Production media
   playback was not retested for this keyboard-only change.
+
+## HDMI DMA-BUF release — 2026-11-27
+
+User authorized real-device bitrate testing, automatic ordinary-user DMA-BUF
+integration, source synchronization to GitHub and a validated new release.
+The default branch remains `store-compliant-20261125`; the unrelated original
+worktree and its unfinished numeric-key changes are preserved.
+
+- Version: `0.1.0-m5stack20`, arm64.
+- Package: `artifacts/streamplayer_0.1.0-m5stack20_arm64.deb`.
+- Package SHA-256: `aafef86bfaab35f83f1dcda4f66c721f918a6cd055806b049b53641bbff42632`.
+- Executable SHA-256: `6d222b16797743acef91f3c6f7f4af211011b7f873329f5fb8e79b9663872cbb`.
+- Payload: 19 regular files; current strict prepublish/listing check passed.
+  Runtime dependencies were checked with `ldd` on the device. Network and
+  external_display are true; the other five store permissions are false.
+- Backup before final installation:
+  `/home/pi/streamplayer-hdmi-upgrade-20261127T133717Z/delivery/backups/20261127T153416Z`.
+  Backup archive SHA-256:
+  `97f6e870f620d7a087dc27aee5c524d812bf2d58349bc96d87a2480e2f3cb94f`.
+  Prior installed version was m5stack19. All 19 installed payload checksums
+  match, the existing account configuration is byte-for-byte unchanged, and
+  APPLaunch user service is active.
+
+HDMI automatically uses existing Wayland and mpv, V4L2 H.264 → BGR0 DRM PRIME
+→ DMA-BUF. The frame pool is bounded to 4 capture / 2 compressed output
+buffers and zero extra hardware frames. Requests respect the attached screen
+and an upper profile of 1280×720, 24 fps, 8 Mbps video + 128 kbps AAC.
+Server-returned URLs are bounded too. The app performs no root service,
+CMA/boot, Wi-Fi or desktop-mode tuning. Playback speed stays 1. The `wlshm`
+fallback has different performance and is not the claimed DMA fast path.
+
+The same version also fixes Series/Season container navigation, real physical
+Tab handling, paused LCD/HDMI switching, and local HLS seeks. The seek fallback
+fetches the full playlist once before trimming, permits only its own private
+local playlist to read HTTP(S) segments, and preserves authentication using
+same-origin segment/key/map URLs without sending the token to other origins.
+It avoids passing an HTTP-only `headers` option to a file input.
+
+Validation completed:
+
+- Native ASan/UBSan: desktop connector/profile/URL/keyboard options, HLS seek
+  and authentication rewriting, LAN discovery and the 32-symbol keymap tests.
+- ARM framebuffer SCons build and Debian package construction passed.
+- Accepted app fixture run (v15), with debug logging off and media authentication
+  required: Season → episodes, automatic HDMI 1280×720 DMA output, Space pause,
+  Tab to paused LCD, resume with changing framebuffer pixels, seek with
+  authenticated HTTP segments, Tab back to DMA HDMI, short Esc back and long
+  Esc clean exit; account configuration unchanged and launcher restored.
+- Final installed binary was launched as UID 1000 with the existing real Emby
+  account. The actual movie “一切如你所见 / You Can See Everything” played through
+  `dmabuf-wayland` + `v4l2m2m`, with no buffering or dropped-frame increments in
+  10 polling samples, speed 1, and MPV CPU about 12.8% of one core. Physical Space
+  pause/resume and long Esc passed. These short checks do not claim full-film
+  or subjective audio-quality validation.
+
+[The public validation note](docs/hdmi-validation-20261127.md) records all six
+real-Emby bitrate arms and two other-media controls, including 24 Mbps buffering,
+plus sanitized numeric results. 20 Mbps was the highest short arm without
+observed buffering; 8 Mbps is the conservative app default. Wi-Fi payload
+capacity measured about 18–26 Mbps, separately from its 72.2 Mbps link rate.
+Earlier failed YUV/GPU/large-pool/startup/seek trials are retained in the private
+local task archive, not discarded or presented as successes. Generated fixture
+media and real-server measurements are identified separately.
+
+Release state: source and GitHub binary release preparation complete; upload
+and store publication receipt pending. The final URLs/status will be appended
+after verification. PR #840 is the older m5stack17 first-release review and
+remains open/unmerged; it is not evidence that m5stack20 is live in the store.
+The attached video currently shows CardputerAdv, so it is not accepted here as
+a StreamPlayer launch/play/exit demo. No self-merge will bypass first review.

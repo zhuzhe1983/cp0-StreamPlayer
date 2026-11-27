@@ -53,8 +53,55 @@ static std::string strip_query_and_fragment(const std::string &url)
     return delimiter == std::string::npos ? url : url.substr(0, delimiter);
 }
 
+static std::string http_origin(std::string url)
+{
+    const auto scheme = url.find("://");
+    if (scheme == std::string::npos) return {};
+    const auto end = url.find_first_of("/?#", scheme + 3);
+    if (end != std::string::npos) url.resize(end);
+    for (char &c : url) c = std::tolower(static_cast<unsigned char>(c));
+    return starts_with(url, "http://") || starts_with(url, "https://") ? url : "";
+}
+
+static std::string authorized_uri(const std::string &base_url,
+                                   const std::string &reference,
+                                   const std::string &access_token)
+{
+    std::string uri = hls_resolve_uri(base_url, reference);
+    // Local HLS inputs cannot consume FFmpeg's HTTP-only -headers option.
+    // Keep authentication in the private playlist, restricted to the server
+    // origin. Keep existing API keys and do not send the token to another host.
+    if (access_token.empty() || http_origin(base_url).empty() ||
+        http_origin(uri) != http_origin(base_url)) return uri;
+    const auto fragment = uri.find('#');
+    const std::string suffix = fragment == std::string::npos ? "" : uri.substr(fragment);
+    if (fragment != std::string::npos) uri.resize(fragment);
+    const auto query = uri.find('?');
+    if (query != std::string::npos) {
+        std::istringstream parts(uri.substr(query + 1));
+        std::string part;
+        while (std::getline(parts, part, '&')) {
+            auto key = part.substr(0, part.find('='));
+            for (char &c : key) c = std::tolower(static_cast<unsigned char>(c));
+            if (key == "api_key") return uri + suffix;
+        }
+    }
+    std::string encoded;
+    const char *hex = "0123456789ABCDEF";
+    for (unsigned char c : access_token) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded += c;
+        } else {
+            encoded += '%'; encoded += hex[c >> 4]; encoded += hex[c & 15];
+        }
+    }
+    return uri + (query == std::string::npos ? "?" : "&") + "api_key=" + encoded + suffix;
+}
+
 static std::string replace_uri_attributes(const std::string &line,
-                                          const std::string &base_url)
+                                          const std::string &base_url,
+                                          const std::string &access_token)
 {
     std::string result = line;
     std::size_t search_from = 0;
@@ -65,8 +112,8 @@ static std::string replace_uri_attributes(const std::string &line,
         const std::size_t value_end = result.find('"', value_begin);
         if (value_end == std::string::npos) break;
         const std::string resolved =
-            hls_resolve_uri(base_url,
-                            result.substr(value_begin, value_end - value_begin));
+            authorized_uri(base_url,
+                            result.substr(value_begin, value_end - value_begin), access_token);
         result.replace(value_begin, value_end - value_begin, resolved);
         search_from = value_begin + resolved.size() + 1;
     }
@@ -74,12 +121,13 @@ static std::string replace_uri_attributes(const std::string &line,
 }
 
 static std::string normalized_output_line(const std::string &line,
-                                          const std::string &base_url)
+                                          const std::string &base_url,
+                                          const std::string &access_token)
 {
     const std::string trimmed = trim_copy(line);
     if (trimmed.empty()) return std::string();
-    if (trimmed[0] != '#') return hls_resolve_uri(base_url, trimmed);
-    return replace_uri_attributes(line, base_url);
+    if (trimmed[0] != '#') return authorized_uri(base_url, trimmed, access_token);
+    return replace_uri_attributes(line, base_url, access_token);
 }
 
 static double extinf_duration(const std::string &line)
@@ -102,6 +150,30 @@ static long long media_sequence_value(const std::string &line)
 }
 
 }  // namespace
+
+std::string hls_local_seek_playlist_path(const std::string &url)
+{
+    const std::string prefix = "file:///tmp/m5streamplayer-seek-";
+    if (url.size() != prefix.size() + 6 + 5 ||
+        url.compare(0, prefix.size(), prefix) != 0 ||
+        url.compare(url.size() - 5, 5, ".m3u8") != 0) return {};
+    for (std::size_t i = prefix.size(); i < prefix.size() + 6; ++i) {
+        if (!std::isalnum(static_cast<unsigned char>(url[i]))) return {};
+    }
+    return url.substr(7);  // file://
+}
+
+std::vector<std::string> hls_seek_input_options(const std::string &url, bool mpv)
+{
+    if (hls_local_seek_playlist_path(url).empty()) return {};
+    const std::string protocols = "file,http,https,tcp,tls,crypto,data";
+    if (mpv) {
+        // mpv's key/value parser needs a quoted comma-containing value.
+        return {"--demuxer-lavf-o=protocol_whitelist=%" +
+                std::to_string(protocols.size()) + "%" + protocols};
+    }
+    return {"-protocol_whitelist", protocols};
+}
 
 std::string hls_resolve_uri(const std::string &base_url, const std::string &reference)
 {
@@ -150,7 +222,8 @@ bool hls_master_variant_uri(const std::string &playlist,
 
 HlsSeekPlaylist hls_trim_media_playlist(const std::string &playlist,
                                         const std::string &media_url,
-                                        long long requested_start_seconds)
+                                        long long requested_start_seconds,
+                                        const std::string &access_token)
 {
     HlsSeekPlaylist result;
     const std::vector<std::string> lines = playlist_lines(playlist);
@@ -222,7 +295,7 @@ HlsSeekPlaylist hls_trim_media_playlist(const std::string &playlist,
             wrote_media_sequence = true;
             continue;
         }
-        output.push_back(normalized_output_line(lines[i], media_url));
+        output.push_back(normalized_output_line(lines[i], media_url, access_token));
     }
     if (!wrote_media_sequence && (has_media_sequence || skipped > 0)) {
         output.push_back("#EXT-X-MEDIA-SEQUENCE:" +
@@ -245,16 +318,16 @@ HlsSeekPlaylist hls_trim_media_playlist(const std::string &playlist,
         if (starts_with(trimmed, "#EXT-X-MAP:")) active_map = lines[i];
     }
     if (!active_key.empty()) {
-        output.push_back(normalized_output_line(active_key, media_url));
+        output.push_back(normalized_output_line(active_key, media_url, access_token));
     }
     if (!active_map.empty()) {
-        output.push_back(normalized_output_line(active_map, media_url));
+        output.push_back(normalized_output_line(active_map, media_url, access_token));
     }
 
     for (std::size_t i = segments[skipped].block_start; i < lines.size(); ++i) {
         const std::string trimmed = trim_copy(lines[i]);
         if (starts_with(trimmed, "#EXT-X-START:")) continue;
-        output.push_back(normalized_output_line(lines[i], media_url));
+        output.push_back(normalized_output_line(lines[i], media_url, access_token));
     }
 
     std::ostringstream rewritten;

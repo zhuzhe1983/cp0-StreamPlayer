@@ -14,6 +14,10 @@ extern "C" {
 void media_controller_init(void);
 void media_controller_attach_keyboard(lv_indev_t *preferred);
 void media_controller_shutdown(void);
+/* Called on the LVGL main thread before keypad navigation consumes Tab.
+ * Returns nonzero only on the playback screen; text-entry navigation stays
+ * with LVGL. A release/repeat is consumed without switching output again. */
+int media_controller_intercept_tab(int pressed);
 
 #ifdef __cplusplus
 }

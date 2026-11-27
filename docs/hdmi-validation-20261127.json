@@ -1,0 +1,111 @@
+{
+  "date": "2026-11-27",
+  "device": "CardputerZero / Raspberry Pi Zero 2 class AArch64",
+  "display": "1920x1080@60 unchanged",
+  "max_transcode_size": [
+    1280,
+    720
+  ],
+  "max_fps": 24,
+  "speed": 1,
+  "sample_count_per_arm": 20,
+  "measurement": "MPV process CPU time / observation wall time; 20 sequential property polling samples after warmup",
+  "arms": [
+    {
+      "media": "A",
+      "requested_video_mbps": 5.0,
+      "elapsed_seconds": 26.51786572799938,
+      "observed_video_mbps_mean": 4.9642717,
+      "observed_video_mbps_max": 6.61373,
+      "interface_receive_mbps": 5.587045711735624,
+      "mpv_cpu_percent": 13.311780202102705,
+      "dropped_frames_delta": 0,
+      "decoder_dropped_frames_delta": 0,
+      "buffering_samples": 0
+    },
+    {
+      "media": "A",
+      "requested_video_mbps": 8.0,
+      "elapsed_seconds": 27.399828735999108,
+      "observed_video_mbps_mean": 7.94383865,
+      "observed_video_mbps_max": 10.557325,
+      "interface_receive_mbps": 10.233988931163847,
+      "mpv_cpu_percent": 13.321251147838264,
+      "dropped_frames_delta": 0,
+      "decoder_dropped_frames_delta": 0,
+      "buffering_samples": 0
+    },
+    {
+      "media": "A",
+      "requested_video_mbps": 12.0,
+      "elapsed_seconds": 25.831037379999543,
+      "observed_video_mbps_mean": 11.686868050000001,
+      "observed_video_mbps_max": 15.849471,
+      "interface_receive_mbps": 14.215279185198813,
+      "mpv_cpu_percent": 15.3303947562948,
+      "dropped_frames_delta": 0,
+      "decoder_dropped_frames_delta": 0,
+      "buffering_samples": 0
+    },
+    {
+      "media": "A",
+      "requested_video_mbps": 16.0,
+      "elapsed_seconds": 25.060613637000642,
+      "observed_video_mbps_mean": 15.84105585,
+      "observed_video_mbps_max": 17.535062,
+      "interface_receive_mbps": 19.082933839014988,
+      "mpv_cpu_percent": 17.27810844027773,
+      "dropped_frames_delta": 0,
+      "decoder_dropped_frames_delta": 0,
+      "buffering_samples": 0
+    },
+    {
+      "media": "A",
+      "requested_video_mbps": 20.0,
+      "elapsed_seconds": 26.011383825998564,
+      "observed_video_mbps_mean": 20.0743552,
+      "observed_video_mbps_max": 26.776538,
+      "interface_receive_mbps": 23.192552769800233,
+      "mpv_cpu_percent": 20.106581160716942,
+      "dropped_frames_delta": 0,
+      "decoder_dropped_frames_delta": 0,
+      "buffering_samples": 0
+    },
+    {
+      "media": "A",
+      "requested_video_mbps": 24.0,
+      "elapsed_seconds": 24.474116157000026,
+      "observed_video_mbps_mean": 21.03660125,
+      "observed_video_mbps_max": 27.763695,
+      "interface_receive_mbps": 21.819977831855617,
+      "mpv_cpu_percent": 18.999664666828092,
+      "dropped_frames_delta": 0,
+      "decoder_dropped_frames_delta": 0,
+      "buffering_samples": 5
+    },
+    {
+      "media": "B",
+      "requested_video_mbps": 8.0,
+      "elapsed_seconds": 25.55629831099941,
+      "observed_video_mbps_mean": 7.995773099999999,
+      "observed_video_mbps_max": 8.65583,
+      "interface_receive_mbps": 9.705501985522107,
+      "mpv_cpu_percent": 13.421349047736427,
+      "dropped_frames_delta": 0,
+      "decoder_dropped_frames_delta": 0,
+      "buffering_samples": 0
+    },
+    {
+      "media": "C",
+      "requested_video_mbps": 8.0,
+      "elapsed_seconds": 26.728459038000437,
+      "observed_video_mbps_mean": 7.9752654000000005,
+      "observed_video_mbps_max": 9.276635,
+      "interface_receive_mbps": 9.487430593715615,
+      "mpv_cpu_percent": 13.805509680725873,
+      "dropped_frames_delta": 0,
+      "decoder_dropped_frames_delta": 0,
+      "buffering_samples": 0
+    }
+  ]
+}
