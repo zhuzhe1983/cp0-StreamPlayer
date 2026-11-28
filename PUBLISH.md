@@ -1,7 +1,9 @@
 # Current delivery: 0.1.0-m5stack21
 
-The latest section at the end records the HDMI DMA-BUF release. Older sections
-below retain the m5stack17/18 submission history and its original limitations.
+The exact tested m5stack21 is approved and live in the STRP store listing, with
+`external_display: true`. Publication and screenshot updates are recorded at the
+end. Earlier sections retain historical m5stack17/18 states and limitations;
+they do not describe the current release.
 
 # StreamPlayer store edition publication
 
@@ -204,3 +206,82 @@ The new review is not being pursued; no replacement video is requested here.
   Verified GitHub release: [v0.1.0-m5stack21](https://github.com/zhuzhe1983/cp0-StreamPlayer/releases/tag/v0.1.0-m5stack21).
   The uploaded asset is 5,578,340 bytes and its GitHub digest matches the
   tested package SHA-256 above. No new store review was created.
+
+## App Store update authorized — 2026-11-28
+
+The user explicitly reauthorized publication after confirming m5stack21 on the
+physical device. This supersedes the earlier temporary deferral. The exact
+5,578,340-byte package is reused: SHA-256
+`8817f8bfc7b8ecaef28eb6adfcda507eac6b0df83d313a4872df0f64a8dcf2be`,
+with executable SHA-256
+`abbe56362f18c796e1d5716d809349054ea8e43923ce0cb869206389fe486dbe`.
+Strict local preflight, archive ownership/modes and current official metadata
+policy passed. STRP and the existing app identity are preserved; the listing
+now declares ordinary-user HDMI/DMA support and external_display permission.
+
+The official current Python czdev initially created same-repository #1024.
+Its workflows completed, but the bot explicitly reported **Validation skipped**
+and its trusted workflow deliberately excludes maintainer-path auto-merging.
+#1024 was closed and the exact same metadata commit
+`497ea9db99dfc6e57d00356158a1be0192e9c274` submitted from the normal contributor
+fork as [PR #1025](https://github.com/CardputerZero/packages/pull/1025).
+No package rebuild or manual merge is involved. The org-controlled upload and
+staging bytes are reused, and the existing-app full-validation/automatic-merge
+workflow ran successfully. PR #1025 was automatically merged at
+`2026-11-28T02:32:27Z` as `adf504fcebe01c2c8f8951cf6a837e92d741c3ff`.
+The bot explicitly reported **Package Validation Passed**, including all 19
+payload files, ARM64 ELF and the exact package SHA. Full validation run:
+<https://github.com/CardputerZero/packages/actions/runs/46098533241>.
+Deployment run <https://github.com/CardputerZero/packages/actions/runs/46098583682>
+and website deployment <https://github.com/CardputerZero/cardputerzero.github.io/actions/runs/46098741562>
+completed successfully. The user-facing, global and China catalogs all deliver
+approved m5stack21 with `external_display: true`; the public apt-pool download
+was fetched and independently hashed to the exact tested package SHA above.
+The installed program was not rebuilt or reinstalled for publication.
+
+## Store screenshots refreshed — 2026-11-28
+
+The user requested meaningful UI/playback captures and replacement of diagnostic
+color bars. The listing now uses four clean native 320×170 PNGs:
+
+| Asset | Actual content and provenance |
+| --- | --- |
+| `store/screenshots/library.png` | Movie library, captured from the installed m5stack21 device. |
+| `store/screenshots/lcd-movie.png` | Real *Shrek Forever After* frame on the LCD, captured from m5stack21; original aspect/letterboxing preserved. |
+| `store/screenshots/hdmi-movie-controls.png` | The same real movie's HDMI controls on the LCD, captured from m5stack21. |
+| `store/screenshots/setup.png` | Retained empty-account setup UI; no private server/account information. |
+
+The generated fixture/color-bar captures and black introduction attempts remain
+private validation records and are not store assets. Device account configuration
+hash stayed unchanged, APPLaunch remained active, and the app was returned to its
+movie detail screen. No package rebuild, installation or system-setting change
+was needed.
+
+Strict package/listing preflight and the current official metadata policy passed.
+The normal contributor-fork [metadata PR #1026](https://github.com/CardputerZero/packages/pull/1026)
+contains only `meta.json` and three PNG changes; the existing manifest, binary,
+STRP/UUID and `external_display: true` are preserved. Validation
+[46099954449](https://github.com/CardputerZero/packages/actions/runs/46099954449)
+passed with the explicit **Package Validation Passed** bot result. It auto-merged
+at `2026-11-28T02:50:13Z` as `d6b40a46156323a8b2c975b994d27e532ee88a6c`.
+The merged image blobs match the checked source bytes and dimensions.
+Deployment [46099991405](https://github.com/CardputerZero/packages/actions/runs/46099991405)
+and website deployment [46100123223](https://github.com/CardputerZero/cardputerzero.github.io/actions/runs/46100123223)
+succeeded. All three catalogs then listed four screenshots; the China mirror
+served all four exact files, while the unchanged GitHub branch URL still cached
+the earlier fixture controls.
+
+To avoid that stale-image URL, the identical real-movie controls PNG was renamed
+to `hdmi-movie-controls.png`. [Follow-up PR #1027](https://github.com/CardputerZero/packages/pull/1027)
+changes only that asset path and metadata. Full validation
+[46100455714](https://github.com/CardputerZero/packages/actions/runs/46100455714)
+passed; automatic merge completed at `2026-11-28T02:56:46Z`, commit
+`60b1026de44f4c3e56b21d697ac6d3b388da0365`. Deployment
+[46100489425](https://github.com/CardputerZero/packages/actions/runs/46100489425)
+completed successfully, as did website deployment
+[46100612752](https://github.com/CardputerZero/cardputerzero.github.io/actions/runs/46100612752).
+The user-facing, global and China catalogs now all list the four final asset
+paths. Every public PNG was downloaded from its catalog URL and matches the
+source SHA-256 and native 320×170 dimensions. Both global and China package
+downloads still match the exact tested m5stack21 SHA-256; HDMI support is YES.
+No review, deployment or image-verification step remains pending for this update.

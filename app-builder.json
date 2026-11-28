@@ -32,8 +32,10 @@
     "source_repo": "https://github.com/zhuzhe1983/cp0-StreamPlayer",
     "icon": "share/images/stream-player.png",
     "screenshots": [
-      "store/screenshots/setup.png",
-      "store/screenshots/hdmi-controls.png"
+      "store/screenshots/library.png",
+      "store/screenshots/lcd-movie.png",
+      "store/screenshots/hdmi-movie-controls.png",
+      "store/screenshots/setup.png"
     ],
     "permissions": {
       "camera": false,
